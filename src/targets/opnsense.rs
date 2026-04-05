@@ -122,7 +122,21 @@ struct FirewallSearchResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FirewallRule {
     pub uuid: String,
+    /// DNAT rules use `descr`, filter rules use `description`.
+    /// Accept either via alias.
+    #[serde(alias = "descr")]
     pub description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DnatSearchResponse {
+    rows: Vec<DnatRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnatRule {
+    pub uuid: String,
+    pub descr: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,7 +155,7 @@ struct DnatRuleData {
     dst_port: String,
     target_ip: String,
     target_port: String,
-    description: String,
+    descr: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -516,8 +530,16 @@ impl OpnSenseClient {
             )));
         }
 
-        let parsed: FirewallSearchResponse = resp.json().await?;
-        Ok(parsed.rows)
+        // DNAT rules use `descr` instead of `description`.
+        let parsed: DnatSearchResponse = resp.json().await?;
+        Ok(parsed
+            .rows
+            .into_iter()
+            .map(|r| FirewallRule {
+                uuid: r.uuid,
+                description: r.descr,
+            })
+            .collect())
     }
 
     /// Create a DNAT (port forward) rule. Returns the new rule's UUID.
@@ -539,7 +561,7 @@ impl OpnSenseClient {
                 dst_port: port.to_string(),
                 target_ip: target_ip.to_owned(),
                 target_port: port.to_string(),
-                description: description.to_owned(),
+                descr: description.to_owned(),
             },
         };
 

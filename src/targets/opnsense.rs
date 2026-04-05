@@ -149,13 +149,19 @@ struct DnatRuleData {
     enabled: String,
     interface: String,
     protocol: String,
-    src_net: String,
-    src_port: String,
-    dst_net: String,
-    dst_port: String,
-    target_ip: String,
-    target_port: String,
+    source: DnatEndpoint,
+    destination: DnatEndpoint,
+    target: String,
+    #[serde(rename = "local-port")]
+    local_port: String,
     descr: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DnatEndpoint {
+    network: String,
+    port: String,
+    not: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -555,12 +561,18 @@ impl OpnSenseClient {
                 enabled: "1".to_owned(),
                 interface: "wan".to_owned(),
                 protocol: protocol.to_owned(),
-                src_net: "any".to_owned(),
-                src_port: "any".to_owned(),
-                dst_net: "wanip".to_owned(),
-                dst_port: port.to_string(),
-                target_ip: target_ip.to_owned(),
-                target_port: port.to_string(),
+                source: DnatEndpoint {
+                    network: "any".to_owned(),
+                    port: "any".to_owned(),
+                    not: "0".to_owned(),
+                },
+                destination: DnatEndpoint {
+                    network: "wanip".to_owned(),
+                    port: port.to_string(),
+                    not: "0".to_owned(),
+                },
+                target: target_ip.to_owned(),
+                local_port: port.to_string(),
                 descr: description.to_owned(),
             },
         };

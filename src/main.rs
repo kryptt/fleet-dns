@@ -293,16 +293,16 @@ async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     let dnat_rules = opnsense.search_dnat_rules().await?;
     let managed_dnat: Vec<_> = dnat_rules
         .iter()
-        .filter(|r| fleet_dns::targets::opnsense::is_fleet_dns_managed(&r.description))
+        .filter(|r| fleet_dns::targets::opnsense::is_fleet_dns_managed(&r.descr))
         .collect();
 
     info!(count = managed_dnat.len(), "found fleet-dns DNAT rules");
     for r in &managed_dnat {
         if config.dry_run {
-            info!(uuid = %r.uuid, desc = %r.description, "[dry-run] would delete DNAT rule");
+            info!(uuid = %r.uuid, desc = %r.descr, "[dry-run] would delete DNAT rule");
         } else {
             opnsense.del_dnat_rule(&r.uuid).await?;
-            info!(uuid = %r.uuid, desc = %r.description, "deleted DNAT rule");
+            info!(uuid = %r.uuid, desc = %r.descr, "deleted DNAT rule");
         }
     }
 

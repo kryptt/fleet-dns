@@ -137,6 +137,10 @@ struct DnatSearchResponse {
 pub struct DnatRule {
     pub uuid: String,
     pub descr: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, rename = "local-port")]
+    pub local_port: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -521,7 +525,7 @@ impl OpnSenseClient {
     // -----------------------------------------------------------------------
 
     /// Search all DNAT rules.
-    pub async fn search_dnat_rules(&self) -> Result<Vec<FirewallRule>, Error> {
+    pub async fn search_dnat_rules(&self) -> Result<Vec<DnatRule>, Error> {
         let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
         let resp = self
             .post("/api/firewall/d_nat/search_rule")
@@ -536,16 +540,8 @@ impl OpnSenseClient {
             )));
         }
 
-        // DNAT rules use `descr` instead of `description`.
         let parsed: DnatSearchResponse = resp.json().await?;
-        Ok(parsed
-            .rows
-            .into_iter()
-            .map(|r| FirewallRule {
-                uuid: r.uuid,
-                description: r.descr,
-            })
-            .collect())
+        Ok(parsed.rows)
     }
 
     /// Create a DNAT (port forward) rule. Returns the new rule's UUID.
@@ -799,11 +795,11 @@ impl OpnSenseClient {
         let existing_filter = self.search_filter_rules().await?;
         let mut stats = ReconcileStats::default();
 
-        // Index existing rules by their marker description.
-        let dnat_by_desc: HashSet<&str> = existing_dnat
+        // Index existing DNAT rules by description, keeping target+port for comparison.
+        let dnat_by_desc: HashMap<&str, &DnatRule> = existing_dnat
             .iter()
-            .filter(|r| is_fleet_dns_managed(&r.description))
-            .map(|r| r.description.as_str())
+            .filter(|r| is_fleet_dns_managed(&r.descr))
+            .map(|r| (r.descr.as_str(), r))
             .collect();
 
         let filter_by_desc: HashSet<&str> = existing_filter
@@ -850,7 +846,26 @@ impl OpnSenseClient {
                     Protocol::Udp => "UDP",
                 };
 
-                let dnat_exists = dnat_by_desc.contains(marker.as_str());
+                let mut dnat_exists = false;
+                if let Some(existing) = dnat_by_desc.get(marker.as_str()) {
+                    let target_str = target_ip.to_string();
+                    let port_str = pf.port.to_string();
+                    if existing.target == target_str && existing.local_port == port_str {
+                        dnat_exists = true;
+                    } else {
+                        // Target or port changed — delete stale rule so it gets recreated.
+                        warn!(
+                            hostname = %entry.hostname,
+                            port = pf.port,
+                            old_target = %existing.target,
+                            new_target = %target_str,
+                            "DNAT rule has stale target; replacing"
+                        );
+                        if !dry_run {
+                            self.del_dnat_rule(&existing.uuid).await?;
+                        }
+                    }
+                }
                 let filter_exists = filter_by_desc.contains(marker.as_str());
 
                 if dnat_exists && filter_exists {
@@ -913,19 +928,19 @@ impl OpnSenseClient {
 
         // Delete orphaned DNAT rules.
         for rule in &existing_dnat {
-            if is_fleet_dns_managed(&rule.description)
-                && !desired_markers.contains(&rule.description)
+            if is_fleet_dns_managed(&rule.descr)
+                && !desired_markers.contains(&rule.descr)
             {
                 if dry_run {
                     info!(
-                        description = %rule.description,
+                        description = %rule.descr,
                         uuid = %rule.uuid,
                         "[dry-run] would delete orphaned DNAT rule"
                     );
                 } else {
                     self.del_dnat_rule(&rule.uuid).await?;
                     info!(
-                        description = %rule.description,
+                        description = %rule.descr,
                         uuid = %rule.uuid,
                         "deleted orphaned DNAT rule"
                     );
@@ -972,7 +987,7 @@ impl OpnSenseClient {
             let verify_filter = self.search_filter_rules().await?;
 
             let dnat_ok = desired_markers.iter().all(|m| {
-                verify_dnat.iter().any(|r| r.description == *m)
+                verify_dnat.iter().any(|r| r.descr == *m)
             });
             let filter_ok = desired_markers.iter().all(|m| {
                 verify_filter.iter().any(|r| r.description == *m)

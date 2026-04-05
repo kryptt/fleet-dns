@@ -145,7 +145,7 @@ pub async fn apply_configmap(
     };
 
     let api: Api<ConfigMap> = Api::namespaced(client, CONFIGMAP_NAMESPACE);
-    let params = PatchParams::apply("fleet-dns");
+    let params = PatchParams::apply("fleet-dns").force();
     api.patch(CONFIGMAP_NAME, &params, &Patch::Apply(&cm))
         .await?;
 

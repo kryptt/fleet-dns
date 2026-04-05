@@ -306,9 +306,8 @@ pub fn build_desired_state(
         let macvlan_ip = find_macvlan_ip(&matching_pods);
 
         let wan_expose = match get_label(&labels, "wan-expose") {
-            Some("skip") => WanExpose::Skip,
-            _ => {
-                // Only expose WAN if there is a macvlan IP.
+            Some("true") => {
+                // Explicit opt-in: expose WAN if there is a macvlan IP.
                 match macvlan_ip {
                     Some(_) => {
                         let ports = match get_label(&labels, "wan-ports") {
@@ -323,9 +322,16 @@ pub fn build_desired_state(
                             WanExpose::Expose { ports }
                         }
                     }
-                    None => WanExpose::Skip,
+                    None => {
+                        warn!(
+                            hostname = %hostname,
+                            "wan-expose=true but no macvlan IP; skipping"
+                        );
+                        WanExpose::Skip
+                    }
                 }
             }
+            _ => WanExpose::Skip,
         };
 
         state.insert(hostname.clone(), DnsEntry {
@@ -613,7 +619,7 @@ mod tests {
             "plex",
             "Host(`plex.hr-home.xyz`)",
             "plex-svc",
-            labels(&[("hr-home.xyz/dns", "true")]),
+            labels(&[("hr-home.xyz/dns", "true"), ("hr-home.xyz/wan-expose", "true")]),
         );
         let svc = make_service(
             "media",
@@ -650,6 +656,7 @@ mod tests {
             "plex-svc",
             labels(&[
                 ("hr-home.xyz/dns", "true"),
+                ("hr-home.xyz/wan-expose", "true"),
                 ("hr-home.xyz/wan-ports", "32400/tcp,32469/tcp"),
             ]),
         );

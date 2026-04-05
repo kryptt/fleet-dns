@@ -174,22 +174,18 @@ struct SavepointResponse {
     revision: Option<String>,
 }
 
-/// Response from diagnostics interface config.
+/// Response from /api/interfaces/overview/interfaces_info.
+/// Returns a map of interface name -> info.
 #[derive(Debug, Deserialize)]
-struct InterfaceConfigResponse {
+struct InterfacesInfoResponse {
     #[serde(flatten)]
-    interfaces: HashMap<String, InterfaceInfo>,
+    interfaces: HashMap<String, InterfaceOverview>,
 }
 
 #[derive(Debug, Deserialize)]
-struct InterfaceInfo {
+struct InterfaceOverview {
     #[serde(default)]
-    ipv4: Vec<Ipv4Entry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Ipv4Entry {
-    ipaddr: String,
+    addr4: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +239,7 @@ impl OpnSenseClient {
     pub async fn search_host_overrides(&self) -> Result<Vec<UnboundHostOverride>, Error> {
         let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
         let resp = self
-            .post("/api/unbound/settings/searchHostOverride")
+            .post("/api/unbound/settings/search_host_override")
             .json(&body)
             .send()
             .await?;
@@ -251,7 +247,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "searchHostOverride returned {status}"
+                "search_host_override returned {status}"
             )));
         }
 
@@ -279,7 +275,7 @@ impl OpnSenseClient {
         };
 
         let resp = self
-            .post("/api/unbound/settings/addHostOverride")
+            .post("/api/unbound/settings/add_host_override")
             .json(&body)
             .send()
             .await?;
@@ -287,7 +283,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "addHostOverride returned {status}"
+                "add_host_override returned {status}"
             )));
         }
 
@@ -315,7 +311,7 @@ impl OpnSenseClient {
         };
 
         let resp = self
-            .post(&format!("/api/unbound/settings/setHostOverride/{uuid}"))
+            .post(&format!("/api/unbound/settings/set_host_override/{uuid}"))
             .json(&body)
             .send()
             .await?;
@@ -323,7 +319,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "setHostOverride({uuid}) returned {status}"
+                "set_host_override({uuid}) returned {status}"
             )));
         }
 
@@ -333,7 +329,7 @@ impl OpnSenseClient {
     /// Delete a host override by UUID.
     pub async fn del_host_override(&self, uuid: &str) -> Result<(), Error> {
         let resp = self
-            .post(&format!("/api/unbound/settings/delHostOverride/{uuid}"))
+            .post(&format!("/api/unbound/settings/del_host_override/{uuid}"))
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -341,7 +337,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "delHostOverride({uuid}) returned {status}"
+                "del_host_override({uuid}) returned {status}"
             )));
         }
 
@@ -508,7 +504,7 @@ impl OpnSenseClient {
     pub async fn search_dnat_rules(&self) -> Result<Vec<FirewallRule>, Error> {
         let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
         let resp = self
-            .post("/api/firewall/dNat/searchRule")
+            .post("/api/firewall/d_nat/search_rule")
             .json(&body)
             .send()
             .await?;
@@ -516,7 +512,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "searchDnatRule returned {status}"
+                "search_dnat_rule returned {status}"
             )));
         }
 
@@ -548,7 +544,7 @@ impl OpnSenseClient {
         };
 
         let resp = self
-            .post("/api/firewall/dNat/addRule")
+            .post("/api/firewall/d_nat/add_rule")
             .json(&body)
             .send()
             .await?;
@@ -556,20 +552,20 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "addDnatRule returned {status}"
+                "add_dnat_rule returned {status}"
             )));
         }
 
         let parsed: UuidResponse = resp.json().await?;
         parsed.uuid.ok_or_else(|| {
-            Error::OpnSense("addDnatRule response missing uuid".to_owned())
+            Error::OpnSense("add_dnat_rule response missing uuid".to_owned())
         })
     }
 
     /// Delete a DNAT rule by UUID.
     pub async fn del_dnat_rule(&self, uuid: &str) -> Result<(), Error> {
         let resp = self
-            .post(&format!("/api/firewall/dNat/delRule/{uuid}"))
+            .post(&format!("/api/firewall/d_nat/del_rule/{uuid}"))
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -577,7 +573,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "delDnatRule({uuid}) returned {status}"
+                "del_dnat_rule({uuid}) returned {status}"
             )));
         }
 
@@ -588,7 +584,7 @@ impl OpnSenseClient {
     pub async fn search_filter_rules(&self) -> Result<Vec<FirewallRule>, Error> {
         let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
         let resp = self
-            .post("/api/firewall/filter/searchRule")
+            .post("/api/firewall/filter/search_rule")
             .json(&body)
             .send()
             .await?;
@@ -596,7 +592,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "searchFilterRule returned {status}"
+                "search_filter_rule returned {status}"
             )));
         }
 
@@ -627,7 +623,7 @@ impl OpnSenseClient {
         };
 
         let resp = self
-            .post("/api/firewall/filter/addRule")
+            .post("/api/firewall/filter/add_rule")
             .json(&body)
             .send()
             .await?;
@@ -635,20 +631,20 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "addFilterRule returned {status}"
+                "add_filter_rule returned {status}"
             )));
         }
 
         let parsed: UuidResponse = resp.json().await?;
         parsed.uuid.ok_or_else(|| {
-            Error::OpnSense("addFilterRule response missing uuid".to_owned())
+            Error::OpnSense("add_filter_rule response missing uuid".to_owned())
         })
     }
 
     /// Delete a firewall filter rule by UUID.
     pub async fn del_filter_rule(&self, uuid: &str) -> Result<(), Error> {
         let resp = self
-            .post(&format!("/api/firewall/filter/delRule/{uuid}"))
+            .post(&format!("/api/firewall/filter/del_rule/{uuid}"))
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -656,7 +652,7 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "delFilterRule({uuid}) returned {status}"
+                "del_filter_rule({uuid}) returned {status}"
             )));
         }
 
@@ -666,7 +662,7 @@ impl OpnSenseClient {
     /// Create a firewall savepoint for atomic apply with rollback.
     pub async fn firewall_savepoint(&self) -> Result<String, Error> {
         let resp = self
-            .post("/api/firewall/dNat/savepoint")
+            .post("/api/firewall/d_nat/savepoint")
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -687,7 +683,7 @@ impl OpnSenseClient {
     /// Apply pending firewall changes.
     pub async fn firewall_apply(&self) -> Result<(), Error> {
         let resp = self
-            .post("/api/firewall/dNat/apply")
+            .post("/api/firewall/d_nat/apply")
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -705,7 +701,7 @@ impl OpnSenseClient {
     /// Cancel rollback (confirm the savepoint), making changes permanent.
     pub async fn cancel_rollback(&self, savepoint: &str) -> Result<(), Error> {
         let resp = self
-            .post(&format!("/api/firewall/dNat/cancelRollback/{savepoint}"))
+            .post(&format!("/api/firewall/d_nat/cancel_rollback/{savepoint}"))
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -713,41 +709,38 @@ impl OpnSenseClient {
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "cancelRollback({savepoint}) returned {status}"
+                "cancel_rollback({savepoint}) returned {status}"
             )));
         }
 
         Ok(())
     }
 
-    /// Retrieve the WAN IP address from OPNsense diagnostics.
+    /// Retrieve the WAN IP address from OPNsense interfaces overview.
     pub async fn get_wan_ip(&self, interface: &str) -> Result<IpAddr, Error> {
         let resp = self
-            .get("/api/diagnostics/interface/getInterfaceConfig")
+            .get("/api/interfaces/overview/interfaces_info")
             .send()
             .await?;
 
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::OpnSense(format!(
-                "getInterfaceConfig returned {status}"
+                "interfaces_info returned {status}"
             )));
         }
 
-        let parsed: InterfaceConfigResponse = resp.json().await?;
+        let parsed: InterfacesInfoResponse = resp.json().await?;
         let iface = parsed.interfaces.get(interface).ok_or_else(|| {
-            Error::OpnSense(format!("interface {interface} not found in diagnostics"))
+            Error::OpnSense(format!("interface {interface} not found in overview"))
         })?;
 
-        let addr = iface.ipv4.first().ok_or_else(|| {
+        let addr_str = iface.addr4.as_deref().ok_or_else(|| {
             Error::OpnSense(format!("interface {interface} has no IPv4 address"))
         })?;
 
-        addr.ipaddr.parse().map_err(|e| {
-            Error::OpnSense(format!(
-                "failed to parse WAN IP '{}': {e}",
-                addr.ipaddr
-            ))
+        addr_str.parse().map_err(|e| {
+            Error::OpnSense(format!("failed to parse WAN IP '{addr_str}': {e}"))
         })
     }
 

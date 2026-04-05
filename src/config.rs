@@ -18,6 +18,7 @@ pub struct Config {
     pub default_reconcile_interval: Duration,
     pub default_dns_ttl: Duration,
     pub wan_interface: String,
+    pub cloudflare_cname_target: String,
     pub dry_run: bool,
 }
 
@@ -56,6 +57,9 @@ impl Config {
         let wan_interface = std::env::var("WAN_INTERFACE")
             .unwrap_or_else(|_| "wan".to_owned());
 
+        let cloudflare_cname_target = std::env::var("CLOUDFLARE_CNAME_TARGET")
+            .unwrap_or_else(|_| "hr-main.hr-home.xyz".to_owned());
+
         let dry_run = std::env::var("DRY_RUN")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -69,6 +73,7 @@ impl Config {
             default_reconcile_interval,
             default_dns_ttl,
             wan_interface,
+            cloudflare_cname_target,
             dry_run,
         })
     }

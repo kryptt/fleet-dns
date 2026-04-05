@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cloudflare = CloudflareClient::new(
         &config.cloudflare_api_token,
         &config.cloudflare_zone_id,
+        &config.cloudflare_cname_target,
     );
     let opnsense = OpnSenseClient::new(
         &config.opnsense_url,
@@ -264,6 +265,7 @@ async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     let cloudflare = CloudflareClient::new(
         &config.cloudflare_api_token,
         &config.cloudflare_zone_id,
+        &config.cloudflare_cname_target,
     );
 
     // Clean up OPNsense Unbound host overrides.

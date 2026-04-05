@@ -175,15 +175,15 @@ struct SavepointResponse {
 }
 
 /// Response from /api/interfaces/overview/interfaces_info.
-/// Returns a map of interface name -> info.
+/// Paginated response with `rows` array.
 #[derive(Debug, Deserialize)]
 struct InterfacesInfoResponse {
-    #[serde(flatten)]
-    interfaces: HashMap<String, InterfaceOverview>,
+    rows: Vec<InterfaceOverview>,
 }
 
 #[derive(Debug, Deserialize)]
 struct InterfaceOverview {
+    identifier: String,
     #[serde(default)]
     addr4: Option<String>,
 }
@@ -731,15 +731,22 @@ impl OpnSenseClient {
         }
 
         let parsed: InterfacesInfoResponse = resp.json().await?;
-        let iface = parsed.interfaces.get(interface).ok_or_else(|| {
-            Error::OpnSense(format!("interface {interface} not found in overview"))
-        })?;
+        let iface = parsed
+            .rows
+            .iter()
+            .find(|r| r.identifier == interface)
+            .ok_or_else(|| {
+                Error::OpnSense(format!("interface {interface} not found in overview"))
+            })?;
 
         let addr_str = iface.addr4.as_deref().ok_or_else(|| {
             Error::OpnSense(format!("interface {interface} has no IPv4 address"))
         })?;
 
-        addr_str.parse().map_err(|e| {
+        // Strip CIDR prefix if present (e.g., "188.142.71.248/32" -> "188.142.71.248")
+        let bare = addr_str.split('/').next().unwrap_or(addr_str);
+
+        bare.parse().map_err(|e| {
             Error::OpnSense(format!("failed to parse WAN IP '{addr_str}': {e}"))
         })
     }

@@ -241,25 +241,45 @@ impl Reconciler {
     }
 }
 
-/// Find the Traefik pod's cluster IP from the pod store.
+/// Find the Traefik pod's macvlan IP from the pod store.
 ///
-/// Looks for a running pod with the label `app.kubernetes.io/name=traefik`
-/// and returns its `podIP`.
+/// Looks for a running pod with the label `app=traefik` (or
+/// `app.kubernetes.io/name=traefik`) and reads its Multus macvlan IP.
+/// Falls back to podIP if no macvlan annotation is found.
 fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
+    use crate::discovery::parse_multus_ip;
+
     for pod in pods {
         let labels = match pod.metadata.labels.as_ref() {
             Some(l) => l,
             None => continue,
         };
 
-        let is_traefik = labels
-            .get("app.kubernetes.io/name")
-            .is_some_and(|v| v == "traefik");
+        let is_traefik = labels.get("app").is_some_and(|v| v == "traefik")
+            || labels
+                .get("app.kubernetes.io/name")
+                .is_some_and(|v| v == "traefik");
 
         if !is_traefik {
             continue;
         }
 
+        // Prefer macvlan IP from Multus annotation (this is the LAN IP
+        // that all CoreDNS entries should resolve to).
+        // Try network-status first (runtime), then networks (request).
+        let annotations = pod.metadata.annotations.as_ref();
+        for key in [
+            "k8s.v1.cni.cncf.io/network-status",
+            "k8s.v1.cni.cncf.io/networks",
+        ] {
+            if let Some(annotation) = annotations.and_then(|a| a.get(key)) {
+                if let Some(ip) = parse_multus_ip(annotation, "lan-macvlan") {
+                    return Ok(ip);
+                }
+            }
+        }
+
+        // Fall back to podIP if no macvlan annotation.
         let ip_str = pod
             .status
             .as_ref()
@@ -282,6 +302,6 @@ fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
     }
 
     Err(Error::Config(
-        "no running Traefik pod found with label app.kubernetes.io/name=traefik".to_owned(),
+        "no running Traefik pod found with label app=traefik".to_owned(),
     ))
 }

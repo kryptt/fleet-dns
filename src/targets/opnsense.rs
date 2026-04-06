@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use crate::crd::DhcpConfigSpec;
 use crate::error::Error;
 use crate::state::{DnsEntry, Protocol, WanExpose};
-use crate::ReconcileStats;
+use crate::{ReconcileStats, ZONE};
 
 /// Marker prefix embedded in OPNsense descriptions to identify fleet-dns-managed entries.
 const MARKER_PREFIX: &str = "[fleet-dns:";
@@ -258,6 +258,7 @@ struct DnsmasqRangeData {
     start_addr: String,
     end_addr: String,
     lease_time: String,
+    domain: String,
     description: String,
 }
 
@@ -952,6 +953,7 @@ impl OpnSenseClient {
                 start_addr: start.to_owned(),
                 end_addr: end.to_owned(),
                 lease_time: lease_time.to_owned(),
+                domain: ZONE.to_owned(),
                 description: description.to_owned(),
             },
         };
@@ -975,6 +977,7 @@ impl OpnSenseClient {
                 start_addr: start.to_owned(),
                 end_addr: end.to_owned(),
                 lease_time: lease_time.to_owned(),
+                domain: ZONE.to_owned(),
                 description: description.to_owned(),
             },
         };

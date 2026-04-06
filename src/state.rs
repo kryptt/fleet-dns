@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{Pod, Service};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::crd::DhcpReservation;
 use crate::discovery::parse_multus_ip;
@@ -406,12 +406,14 @@ pub fn merge_dhcp_reservations(
     for reservation in reservations {
         let hostname = format!("{}.hr-home.xyz", reservation.spec.hostname);
 
-        if state.contains_key(&hostname) {
+        if let Some(existing) = state.get(&hostname) {
             // IngressRoute already owns this hostname — skip DNS, keep for Dnsmasq.
-            warn!(
+            info!(
                 hostname = %hostname,
-                source = %format!("dhcp/{}", reservation.spec.hostname),
-                "DHCP reservation hostname conflicts with IngressRoute, skipping DNS entry"
+                winning_ip = %existing.lan_ip,
+                dhcp_ip = %reservation.spec.ip,
+                winner = %existing.source,
+                "DHCP reservation hostname already managed by IngressRoute; DNS points to Traefik, DHCP lease still created"
             );
             result.push(Arc::clone(reservation));
             continue;

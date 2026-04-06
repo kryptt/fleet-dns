@@ -15,6 +15,9 @@ pub struct Metrics {
     pub errors_total: Family<Labels, Counter>,
     pub records_managed: Family<Labels, Gauge>,
     pub wan_ip_changes_total: Counter,
+    pub dhcp_reservations_total: Gauge,
+    pub dhcp_pool_size: Gauge,
+    pub ip_conflicts_total: Counter,
 }
 
 impl Metrics {
@@ -59,22 +62,48 @@ impl Metrics {
             wan_ip_changes_total.clone(),
         );
 
+        let dhcp_reservations_total = Gauge::default();
+        sub.register(
+            "dhcp_reservations_total",
+            "Number of DHCP reservations managed",
+            dhcp_reservations_total.clone(),
+        );
+
+        let dhcp_pool_size = Gauge::default();
+        sub.register(
+            "dhcp_pool_size",
+            "Number of addresses in the dynamic DHCP pool",
+            dhcp_pool_size.clone(),
+        );
+
+        let ip_conflicts_total = Counter::default();
+        sub.register(
+            "ip_conflicts_total",
+            "Total number of IP allocation conflicts detected",
+            ip_conflicts_total.clone(),
+        );
+
         Self {
             reconciliations_total,
             reconcile_duration_seconds,
             errors_total,
             records_managed,
             wan_ip_changes_total,
+            dhcp_reservations_total,
+            dhcp_pool_size,
+            ip_conflicts_total,
         }
     }
 }
 
 /// Build a label set with a single `target` key.
+#[must_use]
 pub fn target_label(target: &str) -> Labels {
     vec![("target".to_owned(), target.to_owned())]
 }
 
 /// Build a label set with a single `source` key (for error categorisation).
+#[must_use]
 pub fn error_label(source: &str) -> Labels {
     vec![("source".to_owned(), source.to_owned())]
 }

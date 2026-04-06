@@ -1,7 +1,13 @@
+use std::sync::LazyLock;
+
 use kube::CustomResource;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Compiled regex for extracting Host() patterns from Traefik match rules.
+static HOST_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(Host(?:Regexp)?)\(`([^`]+)`\)").expect("valid regex"));
 
 /// Minimal representation of a Traefik IngressRoute CRD.
 /// Only the fields fleet-dns needs for hostname extraction.
@@ -47,10 +53,10 @@ pub struct IngressRouteService {
 /// - `Host(`foo.hr-home.xyz`)` -> `["foo.hr-home.xyz"]`
 /// - `Host(`a.x`) || Host(`b.x`)` -> `["a.x", "b.x"]`
 /// - `Host(`a.x`) && PathPrefix(`/api`)` -> `["a.x"]`
+#[must_use]
 pub fn extract_hostnames(match_rule: &str) -> Vec<String> {
-    // Match both Host(...) and HostRegexp(...), then keep only plain Host.
-    let re = Regex::new(r"(Host(?:Regexp)?)\(`([^`]+)`\)").expect("valid regex");
-    re.captures_iter(match_rule)
+    HOST_RE
+        .captures_iter(match_rule)
         .filter(|cap| &cap[1] == "Host")
         .map(|cap| cap[2].to_owned())
         .collect()

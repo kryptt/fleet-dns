@@ -8,28 +8,13 @@ use tracing::info;
 
 use crate::error::Error;
 use crate::state::{CloudflareMode, DnsEntry};
-
-/// DNS zone suffix used to identify managed records for cleanup.
-const MANAGED_ZONE: &str = ".hr-home.xyz";
+use crate::{ReconcileStats, MANAGED_ZONE, ZONE};
 
 /// Minimum TTL Cloudflare accepts for non-proxied records.
 const MIN_TTL: u32 = 60;
 
 /// Cloudflare uses TTL = 1 to mean "automatic" for proxied records.
 const AUTO_TTL: u32 = 1;
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/// Statistics from a single reconciliation pass.
-#[derive(Debug, Default)]
-pub struct ReconcileStats {
-    pub created: u32,
-    pub updated: u32,
-    pub deleted: u32,
-    pub skipped: u32,
-}
 
 /// Async client wrapping Cloudflare API v4 for DNS record CRUD.
 ///
@@ -76,6 +61,8 @@ struct DnsRecord {
     content: String,
     ttl: u32,
     proxied: bool,
+    /// Wire type field; deserialized for tests but not read in production logic.
+    #[allow(dead_code)]
     #[serde(rename = "type")]
     record_type: String,
 }
@@ -88,6 +75,7 @@ struct DnsRecord {
 ///
 /// Proxied records always use TTL = 1 ("Auto"). Non-proxied records use the
 /// configured TTL, clamped to a minimum of 60 seconds.
+#[must_use]
 pub fn compute_ttl(mode: &CloudflareMode, ttl: Duration) -> u32 {
     match mode {
         CloudflareMode::Proxied => AUTO_TTL,
@@ -406,7 +394,7 @@ impl CloudflareClient {
         // --- Step 3: Delete orphaned records ---
         // Delete orphaned CNAMEs in *.hr-home.xyz
         for record in &cname_records {
-            let in_zone = record.name.ends_with(MANAGED_ZONE) || record.name == "hr-home.xyz";
+            let in_zone = record.name.ends_with(MANAGED_ZONE) || record.name == ZONE;
             if in_zone && !accounted.contains(record.name.as_str()) {
                 if dry_run {
                     info!(
@@ -423,7 +411,7 @@ impl CloudflareClient {
 
         // Delete orphaned A records in *.hr-home.xyz (except cname_target)
         for record in &a_records {
-            let in_zone = record.name.ends_with(MANAGED_ZONE) || record.name == "hr-home.xyz";
+            let in_zone = record.name.ends_with(MANAGED_ZONE) || record.name == ZONE;
             if in_zone
                 && record.name != self.cname_target
                 && !accounted.contains(record.name.as_str())

@@ -21,6 +21,7 @@ pub enum Error {
 
 impl Error {
     /// Short label suitable for Prometheus metric labels.
+    #[must_use]
     pub fn metric_label(&self) -> &str {
         match self {
             Error::Kube(_) => "kube",

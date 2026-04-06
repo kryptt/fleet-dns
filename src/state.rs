@@ -6,17 +6,16 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use tracing::warn;
 
+use crate::crd::DhcpReservation;
 use crate::discovery::parse_multus_ip;
 use crate::traefik::{extract_hostnames, IngressRoute};
+use crate::{MANAGED_ZONE, ZONE};
 
 /// The Multus network attachment name used for LAN macvlan interfaces.
 const MACVLAN_NETWORK: &str = "lan-macvlan";
 
 /// The annotation key for Multus network status.
 const MULTUS_STATUS_ANNOTATION: &str = "k8s.v1.cni.cncf.io/network-status";
-
-/// DNS zone suffix that fleet-dns manages. Hostnames outside this zone are skipped.
-const MANAGED_ZONE: &str = ".hr-home.xyz";
 
 /// Label prefix for fleet-dns annotations on IngressRoutes.
 const LABEL_PREFIX: &str = "hr-home.xyz/";
@@ -87,6 +86,7 @@ fn get_label<'a>(labels: &'a BTreeMap<String, String>, suffix: &str) -> Option<&
 ///
 /// Accepted formats: `"5m"`, `"1h"`, `"30s"`, or bare seconds `"300"`.
 /// Returns `None` on invalid input.
+#[must_use]
 pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -111,6 +111,7 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
 }
 
 /// Parse a port-forward specification like `"32400/tcp,32469/udp"`.
+#[must_use]
 pub fn parse_wan_ports(s: &str) -> Vec<PortForward> {
     s.split(',')
         .filter_map(|entry| {
@@ -231,6 +232,7 @@ fn infer_ports_from_service(svc: &Service) -> Vec<PortForward> {
 ///
 /// Iterates all IngressRoutes, extracts `*.hr-home.xyz` hostnames, and
 /// enriches each with macvlan IP, labels, and port information.
+#[must_use]
 pub fn build_desired_state(
     ingress_store: &[Arc<IngressRoute>],
     pod_store: &[Arc<Pod>],
@@ -245,7 +247,7 @@ pub fn build_desired_state(
 
         for route in &ir.spec.routes {
             for hostname in extract_hostnames(&route.match_rule) {
-                if !hostname.ends_with(MANAGED_ZONE) && hostname != "hr-home.xyz" {
+                if !hostname.ends_with(MANAGED_ZONE) && hostname != ZONE {
                     continue;
                 }
 
@@ -355,6 +357,7 @@ pub fn build_desired_state(
 // ---------------------------------------------------------------------------
 
 /// Compute the change set between desired and current DNS states.
+#[must_use]
 pub fn diff(desired: &DnsState, current: &DnsState) -> DnsChanges {
     let mut changes = DnsChanges::default();
 
@@ -380,6 +383,69 @@ pub fn diff(desired: &DnsState, current: &DnsState) -> DnsChanges {
     changes.remove.sort();
 
     changes
+}
+
+// ---------------------------------------------------------------------------
+// merge_dhcp_reservations
+// ---------------------------------------------------------------------------
+
+/// Merge DHCP reservations into the DNS state.
+///
+/// For each reservation whose hostname does NOT already exist in `state`
+/// (i.e. no IngressRoute claims it), a new [`DnsEntry`] is inserted pointing
+/// directly at the device's IP. Reservations whose hostname collides with an
+/// existing IngressRoute entry are skipped for DNS purposes — Traefik wins —
+/// but are still included in the returned `Vec` so Dnsmasq can process all
+/// static leases.
+pub fn merge_dhcp_reservations(
+    state: &mut DnsState,
+    reservations: &[Arc<DhcpReservation>],
+) -> Vec<Arc<DhcpReservation>> {
+    let mut result: Vec<Arc<DhcpReservation>> = Vec::with_capacity(reservations.len());
+
+    for reservation in reservations {
+        let hostname = format!("{}.hr-home.xyz", reservation.spec.hostname);
+
+        if state.contains_key(&hostname) {
+            // IngressRoute already owns this hostname — skip DNS, keep for Dnsmasq.
+            warn!(
+                hostname = %hostname,
+                source = %format!("dhcp/{}", reservation.spec.hostname),
+                "DHCP reservation hostname conflicts with IngressRoute, skipping DNS entry"
+            );
+            result.push(Arc::clone(reservation));
+            continue;
+        }
+
+        let lan_ip = match reservation.spec.ip.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(err) => {
+                warn!(
+                    hostname = %hostname,
+                    ip = %reservation.spec.ip,
+                    error = %err,
+                    "DHCP reservation has invalid IP, skipping"
+                );
+                continue;
+            }
+        };
+
+        state.insert(hostname.clone(), DnsEntry {
+            hostname: hostname.clone(),
+            lan_ip,
+            macvlan_ip: None,
+            cloudflare_mode: CloudflareMode::Skip,
+            wan_expose: WanExpose::Skip,
+            dns_ttl: Duration::from_secs(300),
+            reconcile_interval: Duration::from_secs(300),
+            managed: true,
+            source: format!("dhcp/{}", reservation.spec.hostname),
+        });
+
+        result.push(Arc::clone(reservation));
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +549,22 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn make_dhcp_reservation(hostname: &str, mac: &str, ip: &str) -> Arc<DhcpReservation> {
+        Arc::new(DhcpReservation {
+            metadata: ObjectMeta {
+                namespace: Some("system".to_owned()),
+                name: Some(hostname.to_owned()),
+                ..Default::default()
+            },
+            spec: crate::crd::DhcpReservationSpec {
+                hostname: hostname.to_owned(),
+                mac: mac.to_owned(),
+                ip: ip.to_owned(),
+                description: None,
+            },
+        })
     }
 
     fn traefik_ip() -> IpAddr {
@@ -950,5 +1032,101 @@ mod tests {
 
         let entry = state.get("registry.hr-home.xyz").unwrap();
         assert_eq!(entry.wan_expose, WanExpose::Skip);
+    }
+
+    // ---- DHCP reservation merge tests ----
+
+    #[test]
+    fn dhcp_reservation_merged_into_empty_state() {
+        let mut state = DnsState::new();
+        let reservation = make_dhcp_reservation("printer", "aa:bb:cc:dd:ee:ff", "192.168.2.100");
+
+        let returned = merge_dhcp_reservations(&mut state, &[reservation]);
+
+        assert_eq!(returned.len(), 1);
+        let entry = state.get("printer.hr-home.xyz").expect("entry must exist");
+        assert_eq!(entry.hostname, "printer.hr-home.xyz");
+        assert_eq!(entry.lan_ip, "192.168.2.100".parse::<IpAddr>().unwrap());
+        assert_eq!(entry.macvlan_ip, None);
+        assert_eq!(entry.cloudflare_mode, CloudflareMode::Skip);
+        assert_eq!(entry.wan_expose, WanExpose::Skip);
+        assert_eq!(entry.dns_ttl, Duration::from_secs(300));
+        assert_eq!(entry.reconcile_interval, Duration::from_secs(300));
+        assert!(entry.managed);
+        assert_eq!(entry.source, "dhcp/printer");
+    }
+
+    #[test]
+    fn dhcp_reservation_conflict_preserves_ingress_entry() {
+        let ir = make_ingress_route(
+            "home",
+            "hass",
+            "Host(`hass.hr-home.xyz`)",
+            "hass-svc",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip());
+
+        let reservation = make_dhcp_reservation("hass", "aa:bb:cc:dd:ee:ff", "192.168.2.50");
+        merge_dhcp_reservations(&mut state, &[reservation]);
+
+        // IngressRoute entry must be preserved, not overwritten.
+        let entry = state.get("hass.hr-home.xyz").unwrap();
+        assert_eq!(entry.lan_ip, traefik_ip());
+        assert_eq!(entry.source, "home/hass");
+    }
+
+    #[test]
+    fn conflicting_reservation_still_returned() {
+        let ir = make_ingress_route(
+            "home",
+            "hass",
+            "Host(`hass.hr-home.xyz`)",
+            "hass-svc",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip());
+
+        let reservation = make_dhcp_reservation("hass", "aa:bb:cc:dd:ee:ff", "192.168.2.50");
+        let returned = merge_dhcp_reservations(&mut state, &[reservation.clone()]);
+
+        // Conflicting reservation must still appear in the returned Vec for Dnsmasq.
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].spec.hostname, "hass");
+    }
+
+    #[test]
+    fn multiple_non_conflicting_reservations_all_merged() {
+        let mut state = DnsState::new();
+        let reservations = vec![
+            make_dhcp_reservation("printer", "aa:bb:cc:00:00:01", "192.168.2.100"),
+            make_dhcp_reservation("camera", "aa:bb:cc:00:00:02", "192.168.2.101"),
+            make_dhcp_reservation("thermostat", "aa:bb:cc:00:00:03", "192.168.2.102"),
+        ];
+
+        let returned = merge_dhcp_reservations(&mut state, &reservations);
+
+        assert_eq!(returned.len(), 3);
+        assert_eq!(state.len(), 3);
+        assert!(state.contains_key("printer.hr-home.xyz"));
+        assert!(state.contains_key("camera.hr-home.xyz"));
+        assert!(state.contains_key("thermostat.hr-home.xyz"));
+
+        assert_eq!(
+            state["camera.hr-home.xyz"].lan_ip,
+            "192.168.2.101".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn dhcp_reservation_invalid_ip_skipped() {
+        let mut state = DnsState::new();
+        let reservation = make_dhcp_reservation("broken", "aa:bb:cc:dd:ee:ff", "not-an-ip");
+
+        let returned = merge_dhcp_reservations(&mut state, &[reservation]);
+
+        // Invalid IP reservation is not added to state or returned Vec.
+        assert!(state.is_empty());
+        assert!(returned.is_empty());
     }
 }

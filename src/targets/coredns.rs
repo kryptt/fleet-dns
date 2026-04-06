@@ -10,9 +10,7 @@ use tracing::{debug, info};
 use crate::crd::CoreDnsPolicy;
 use crate::error::Error;
 use crate::state::DnsEntry;
-
-/// DNS zone managed by fleet-dns.
-const ZONE: &str = "hr-home.xyz";
+use crate::ZONE;
 
 /// ConfigMap key for the zone server block.
 const SERVER_KEY: &str = "hr-home-xyz.server";
@@ -28,6 +26,7 @@ const CONFIGMAP_NAMESPACE: &str = "kube-system";
 /// Non-zone policies (where `spec.zone` is `None`) each become their own
 /// ConfigMap key. Zone-scoped entries and policies are merged into a single
 /// `hr-home-xyz.server` key containing a CoreDNS server block.
+#[must_use]
 pub fn render_configmap_data(
     entries: &[DnsEntry],
     policies: &[Arc<CoreDnsPolicy>],

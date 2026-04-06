@@ -5,24 +5,13 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::crd::DhcpConfigSpec;
 use crate::error::Error;
 use crate::state::{DnsEntry, Protocol, WanExpose};
+use crate::ReconcileStats;
 
 /// Marker prefix embedded in OPNsense descriptions to identify fleet-dns-managed entries.
 const MARKER_PREFIX: &str = "[fleet-dns:";
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/// Statistics from a single reconciliation pass.
-#[derive(Debug, Default)]
-pub struct ReconcileStats {
-    pub created: u32,
-    pub updated: u32,
-    pub deleted: u32,
-    pub skipped: u32,
-}
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -34,6 +23,7 @@ pub struct ReconcileStats {
 /// - `"plex.hr-home.xyz"` -> `("plex", "hr-home.xyz")`
 /// - `"hr-home.xyz"` -> `("", "hr-home.xyz")`
 /// - `"deep.sub.hr-home.xyz"` -> `("deep", "sub.hr-home.xyz")`
+#[must_use]
 pub fn split_hostname(fqdn: &str) -> (&str, &str) {
     match fqdn.find('.') {
         Some(pos) => (&fqdn[..pos], &fqdn[pos + 1..]),
@@ -42,6 +32,7 @@ pub fn split_hostname(fqdn: &str) -> (&str, &str) {
 }
 
 /// Check whether a description string was created by fleet-dns.
+#[must_use]
 pub fn is_fleet_dns_managed(description: &str) -> bool {
     description.starts_with(MARKER_PREFIX)
 }
@@ -51,6 +42,7 @@ pub fn is_fleet_dns_managed(description: &str) -> bool {
 /// `"[fleet-dns:plex.hr-home.xyz]"` -> `Some("plex.hr-home.xyz")`
 /// `"[fleet-dns:plex.hr-home.xyz:32400/tcp]"` -> `Some("plex.hr-home.xyz:32400/tcp")`
 /// `"manual entry"` -> `None`
+#[must_use]
 pub fn extract_marker_payload(description: &str) -> Option<&str> {
     let rest = description.strip_prefix(MARKER_PREFIX)?;
     let payload = rest.strip_suffix(']')?;
@@ -64,6 +56,25 @@ pub fn extract_marker_payload(description: &str) -> Option<&str> {
 /// Build the Unbound description marker for a hostname.
 fn unbound_marker(hostname: &str) -> String {
     format!("{MARKER_PREFIX}{hostname}]")
+}
+
+/// Build the Dnsmasq DHCP host description marker for a hostname.
+fn dnsmasq_host_marker(hostname: &str) -> String {
+    format!("{MARKER_PREFIX}dhcp:{hostname}]")
+}
+
+/// Extract the hostname from a `[fleet-dns:dhcp:{hostname}]` marker.
+///
+/// Returns `None` if the string is not a valid DHCP host marker.
+fn extract_dhcp_hostname(descr: &str) -> Option<&str> {
+    let rest = descr.strip_prefix("[fleet-dns:dhcp:")?;
+    let hostname = rest.strip_suffix(']')?;
+    if hostname.is_empty() { None } else { Some(hostname) }
+}
+
+/// Build the Dnsmasq DHCP range description marker.
+fn dnsmasq_range_marker() -> String {
+    format!("{MARKER_PREFIX}dhcp-range]")
 }
 
 /// Build the NAT/firewall description marker for a port forward rule.
@@ -186,6 +197,185 @@ struct FilterRuleData {
     description: String,
 }
 
+// ---------------------------------------------------------------------------
+// Dnsmasq DHCP wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct DnsmasqHostSearchResponse {
+    rows: Vec<DnsmasqHost>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsmasqHost {
+    pub uuid: String,
+    pub host: String,
+    pub domain: String,
+    pub ip: String,
+    pub hwaddr: String,
+    pub descr: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsmasqHostPayload {
+    host: DnsmasqHostData,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsmasqHostData {
+    host: String,
+    domain: String,
+    ip: String,
+    hwaddr: String,
+    descr: String,
+}
+
+// ---------------------------------------------------------------------------
+// Dnsmasq DHCP range wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct DnsmasqRangeSearchResponse {
+    rows: Vec<DnsmasqRange>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsmasqRange {
+    pub uuid: String,
+    pub start_addr: String,
+    pub end_addr: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsmasqRangePayload {
+    range: DnsmasqRangeData,
+}
+
+#[derive(Debug, Serialize)]
+struct DnsmasqRangeData {
+    interface: String,
+    start_addr: String,
+    end_addr: String,
+    lease_time: String,
+    description: String,
+}
+
+// ---------------------------------------------------------------------------
+// IP validation (pure, testable)
+// ---------------------------------------------------------------------------
+
+/// Parse an IPv4 address string into its four octets.
+///
+/// Returns `None` for anything that is not a valid dotted-quad.
+#[must_use]
+pub fn parse_ipv4_octets(ip: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let a = parts[0].parse::<u8>().ok()?;
+    let b = parts[1].parse::<u8>().ok()?;
+    let c = parts[2].parse::<u8>().ok()?;
+    let d = parts[3].parse::<u8>().ok()?;
+    Some([a, b, c, d])
+}
+
+/// Convert four octets to a `u32` for range comparisons.
+#[must_use]
+pub fn octets_to_u32(octets: [u8; 4]) -> u32 {
+    u32::from_be_bytes(octets)
+}
+
+/// Validate that reserved ranges and static reservation IPs do not overlap
+/// with the dynamic DHCP pool.
+///
+/// Returns a list of human-readable conflict descriptions. An empty vec
+/// means no conflicts were found.
+#[must_use]
+pub fn validate_ip_allocation(
+    reserved_ranges: &[String],
+    reservation_ips: &[String],
+    pool_start: &str,
+    pool_end: &str,
+) -> Vec<String> {
+    let mut conflicts = Vec::new();
+
+    let ps = match parse_ipv4_octets(pool_start) {
+        Some(o) => octets_to_u32(o),
+        None => {
+            conflicts.push(format!("Invalid pool start address: {pool_start}"));
+            return conflicts;
+        }
+    };
+    let pe = match parse_ipv4_octets(pool_end) {
+        Some(o) => octets_to_u32(o),
+        None => {
+            conflicts.push(format!("Invalid pool end address: {pool_end}"));
+            return conflicts;
+        }
+    };
+
+    for range_str in reserved_ranges {
+        let parts: Vec<&str> = range_str.split('-').collect();
+        if parts.len() != 2 {
+            conflicts.push(format!("Malformed reserved range: {range_str}"));
+            continue;
+        }
+
+        let rs = match parse_ipv4_octets(parts[0]) {
+            Some(o) => octets_to_u32(o),
+            None => {
+                conflicts.push(format!("Invalid start IP in reserved range: {}", parts[0]));
+                continue;
+            }
+        };
+        let re = match parse_ipv4_octets(parts[1]) {
+            Some(o) => octets_to_u32(o),
+            None => {
+                conflicts.push(format!("Invalid end IP in reserved range: {}", parts[1]));
+                continue;
+            }
+        };
+
+        // Two ranges overlap when neither is entirely before or after the other.
+        if rs <= pe && re >= ps {
+            conflicts.push(format!(
+                "Reserved range {range_str} overlaps with DHCP pool {pool_start}-{pool_end}"
+            ));
+        }
+    }
+
+    for ip_str in reservation_ips {
+        let ip = match parse_ipv4_octets(ip_str) {
+            Some(o) => octets_to_u32(o),
+            None => {
+                conflicts.push(format!("Invalid reservation IP: {ip_str}"));
+                continue;
+            }
+        };
+
+        if ip >= ps && ip <= pe {
+            conflicts.push(format!(
+                "Reservation {ip_str} falls inside DHCP pool {pool_start}-{pool_end}"
+            ));
+        }
+    }
+
+    conflicts
+}
+
+/// A desired DHCP host reservation for reconciliation.
+pub struct DhcpHostEntry {
+    pub hostname: String,
+    pub ip: String,
+    pub mac: String,
+}
+
+// ---------------------------------------------------------------------------
+// Generic OPNsense response types
+// ---------------------------------------------------------------------------
+
 /// Generic OPNsense mutation response: `{"uuid":"..."}`.
 #[derive(Debug, Deserialize)]
 struct UuidResponse {
@@ -255,27 +445,54 @@ impl OpnSenseClient {
             .basic_auth(&self.api_key, Some(&self.api_secret))
     }
 
+    /// POST JSON to `path`, check for a success status, and deserialize the response.
+    ///
+    /// `context` is used in the error message on failure (e.g. `"add_host_override"`).
+    async fn post_json<B: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        context: &str,
+    ) -> Result<R, Error> {
+        let resp = self.post(path).json(body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::OpnSense(format!("{context} returned {status}")));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// POST JSON to `path`, check for a success status, and discard the response body.
+    ///
+    /// `context` is used in the error message on failure.
+    async fn post_json_ok<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        context: &str,
+    ) -> Result<(), Error> {
+        let resp = self.post(path).json(body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::OpnSense(format!("{context} returned {status}")));
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Unbound host overrides
     // -----------------------------------------------------------------------
 
-    /// Search all host overrides, optionally filtering by description phrase.
+    /// Search all host overrides, filtering by the fleet-dns marker prefix.
     pub async fn search_host_overrides(&self) -> Result<Vec<UnboundHostOverride>, Error> {
         let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
-        let resp = self
-            .post("/api/unbound/settings/search_host_override")
-            .json(&body)
-            .send()
+        let parsed: UnboundSearchResponse = self
+            .post_json(
+                "/api/unbound/settings/search_host_override",
+                &body,
+                "search_host_override",
+            )
             .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "search_host_override returned {status}"
-            )));
-        }
-
-        let parsed: UnboundSearchResponse = resp.json().await?;
         Ok(parsed.rows)
     }
 
@@ -297,21 +514,12 @@ impl OpnSenseClient {
                 description: description.to_owned(),
             },
         };
-
-        let resp = self
-            .post("/api/unbound/settings/add_host_override")
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "add_host_override returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            "/api/unbound/settings/add_host_override",
+            &body,
+            "add_host_override",
+        )
+        .await
     }
 
     /// Update an existing host override by UUID.
@@ -333,57 +541,32 @@ impl OpnSenseClient {
                 description: description.to_owned(),
             },
         };
-
-        let resp = self
-            .post(&format!("/api/unbound/settings/set_host_override/{uuid}"))
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "set_host_override({uuid}) returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            &format!("/api/unbound/settings/set_host_override/{uuid}"),
+            &body,
+            &format!("set_host_override({uuid})"),
+        )
+        .await
     }
 
     /// Delete a host override by UUID.
     pub async fn del_host_override(&self, uuid: &str) -> Result<(), Error> {
-        let resp = self
-            .post(&format!("/api/unbound/settings/del_host_override/{uuid}"))
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "del_host_override({uuid}) returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            &format!("/api/unbound/settings/del_host_override/{uuid}"),
+            &serde_json::json!({}),
+            &format!("del_host_override({uuid})"),
+        )
+        .await
     }
 
     /// Apply pending Unbound configuration changes.
     pub async fn unbound_reconfigure(&self) -> Result<(), Error> {
-        let resp = self
-            .post("/api/unbound/service/reconfigure")
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "unbound reconfigure returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            "/api/unbound/service/reconfigure",
+            &serde_json::json!({}),
+            "unbound reconfigure",
+        )
+        .await
     }
 
     /// Reconcile Unbound host overrides to match the desired DNS entries.
@@ -521,26 +704,405 @@ impl OpnSenseClient {
     }
 
     // -----------------------------------------------------------------------
+    // Dnsmasq DHCP host reservations
+    // -----------------------------------------------------------------------
+
+    /// Search all Dnsmasq hosts managed by fleet-dns.
+    pub async fn search_dnsmasq_hosts(&self) -> Result<Vec<DnsmasqHost>, Error> {
+        let body = serde_json::json!({"searchPhrase": "[fleet-dns:dhcp:"});
+        let parsed: DnsmasqHostSearchResponse = self
+            .post_json("/api/dnsmasq/settings/searchHost", &body, "searchHost")
+            .await?;
+        Ok(parsed.rows)
+    }
+
+    /// Create a new Dnsmasq DHCP host reservation.
+    pub async fn add_dnsmasq_host(
+        &self,
+        hostname: &str,
+        domain: &str,
+        ip: &str,
+        mac: &str,
+        description: &str,
+    ) -> Result<(), Error> {
+        let body = DnsmasqHostPayload {
+            host: DnsmasqHostData {
+                host: hostname.to_owned(),
+                domain: domain.to_owned(),
+                ip: ip.to_owned(),
+                hwaddr: mac.to_owned(),
+                descr: description.to_owned(),
+            },
+        };
+        self.post_json_ok("/api/dnsmasq/settings/addHost", &body, "addHost")
+            .await
+    }
+
+    /// Update an existing Dnsmasq DHCP host reservation by UUID.
+    pub async fn set_dnsmasq_host(
+        &self,
+        uuid: &str,
+        hostname: &str,
+        domain: &str,
+        ip: &str,
+        mac: &str,
+        description: &str,
+    ) -> Result<(), Error> {
+        let body = DnsmasqHostPayload {
+            host: DnsmasqHostData {
+                host: hostname.to_owned(),
+                domain: domain.to_owned(),
+                ip: ip.to_owned(),
+                hwaddr: mac.to_owned(),
+                descr: description.to_owned(),
+            },
+        };
+        self.post_json_ok(
+            &format!("/api/dnsmasq/settings/setHost/{uuid}"),
+            &body,
+            &format!("setHost({uuid})"),
+        )
+        .await
+    }
+
+    /// Delete a Dnsmasq DHCP host reservation by UUID.
+    pub async fn del_dnsmasq_host(&self, uuid: &str) -> Result<(), Error> {
+        self.post_json_ok(
+            &format!("/api/dnsmasq/settings/delHost/{uuid}"),
+            &serde_json::json!({}),
+            &format!("delHost({uuid})"),
+        )
+        .await
+    }
+
+    /// Apply pending Dnsmasq configuration changes.
+    pub async fn dnsmasq_reconfigure(&self) -> Result<(), Error> {
+        self.post_json_ok(
+            "/api/dnsmasq/service/reconfigure",
+            &serde_json::json!({}),
+            "dnsmasq reconfigure",
+        )
+        .await
+    }
+
+    /// Reconcile Dnsmasq DHCP host reservations to match desired entries.
+    ///
+    /// Each entry produces a reservation with marker `[fleet-dns:dhcp:{hostname}]`.
+    /// Domain is always `hr-home.xyz`.
+    pub async fn reconcile_dnsmasq_hosts(
+        &self,
+        reservations: &[DhcpHostEntry],
+        dry_run: bool,
+    ) -> Result<ReconcileStats, Error> {
+        let existing = self.search_dnsmasq_hosts().await?;
+        let mut stats = ReconcileStats::default();
+
+        // Index existing fleet-dns DHCP hosts by their marker hostname.
+        let existing_by_hostname: HashMap<&str, &DnsmasqHost> = existing
+            .iter()
+            .filter_map(|h| extract_dhcp_hostname(&h.descr).map(|name| (name, h)))
+            .collect();
+
+        let mut accounted: HashSet<&str> = HashSet::with_capacity(reservations.len());
+
+        for entry in reservations {
+            let marker = dnsmasq_host_marker(&entry.hostname);
+            let (host, domain) = split_hostname(&entry.hostname);
+
+            accounted.insert(&entry.hostname);
+
+            match existing_by_hostname.get(entry.hostname.as_str()) {
+                Some(existing_host) => {
+                    let ip_changed = existing_host.ip != entry.ip;
+                    let mac_changed = existing_host.hwaddr != entry.mac;
+
+                    if ip_changed || mac_changed {
+                        if dry_run {
+                            info!(
+                                hostname = %entry.hostname,
+                                old_ip = %existing_host.ip,
+                                new_ip = %entry.ip,
+                                old_mac = %existing_host.hwaddr,
+                                new_mac = %entry.mac,
+                                "[dry-run] would update Dnsmasq DHCP host"
+                            );
+                        } else {
+                            self.set_dnsmasq_host(
+                                &existing_host.uuid,
+                                host,
+                                domain,
+                                &entry.ip,
+                                &entry.mac,
+                                &marker,
+                            )
+                            .await?;
+                            info!(
+                                hostname = %entry.hostname,
+                                ip = %entry.ip,
+                                mac = %entry.mac,
+                                uuid = %existing_host.uuid,
+                                "updated Dnsmasq DHCP host"
+                            );
+                        }
+                        stats.updated += 1;
+                    } else {
+                        debug!(hostname = %entry.hostname, "Dnsmasq DHCP host unchanged");
+                    }
+                }
+                None => {
+                    if dry_run {
+                        info!(
+                            hostname = %entry.hostname,
+                            ip = %entry.ip,
+                            mac = %entry.mac,
+                            "[dry-run] would create Dnsmasq DHCP host"
+                        );
+                    } else {
+                        self.add_dnsmasq_host(
+                            host,
+                            domain,
+                            &entry.ip,
+                            &entry.mac,
+                            &marker,
+                        )
+                        .await?;
+                        info!(
+                            hostname = %entry.hostname,
+                            ip = %entry.ip,
+                            mac = %entry.mac,
+                            "created Dnsmasq DHCP host"
+                        );
+                    }
+                    stats.created += 1;
+                }
+            }
+        }
+
+        // Delete orphaned DHCP hosts that fleet-dns manages but no longer desires.
+        for host in &existing {
+            let hostname = match extract_dhcp_hostname(&host.descr) {
+                Some(h) => h,
+                None => continue,
+            };
+
+            if !accounted.contains(hostname) {
+                if dry_run {
+                    info!(
+                        hostname = hostname,
+                        uuid = %host.uuid,
+                        "[dry-run] would delete orphaned Dnsmasq DHCP host"
+                    );
+                } else {
+                    self.del_dnsmasq_host(&host.uuid).await?;
+                    info!(
+                        hostname = hostname,
+                        uuid = %host.uuid,
+                        "deleted orphaned Dnsmasq DHCP host"
+                    );
+                }
+                stats.deleted += 1;
+            }
+        }
+
+        let mutated = stats.created > 0 || stats.updated > 0 || stats.deleted > 0;
+
+        if mutated && !dry_run {
+            self.dnsmasq_reconfigure().await?;
+            info!("Dnsmasq reconfigured");
+        }
+
+        if mutated {
+            info!(
+                created = stats.created,
+                updated = stats.updated,
+                deleted = stats.deleted,
+                dry_run,
+                "Dnsmasq DHCP reconciliation complete"
+            );
+        }
+
+        Ok(stats)
+    }
+
+    // -----------------------------------------------------------------------
+    // Dnsmasq DHCP ranges
+    // -----------------------------------------------------------------------
+
+    /// Search all Dnsmasq DHCP ranges.
+    pub async fn search_dnsmasq_ranges(&self) -> Result<Vec<DnsmasqRange>, Error> {
+        let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
+        let parsed: DnsmasqRangeSearchResponse = self
+            .post_json("/api/dnsmasq/settings/searchRange", &body, "searchRange")
+            .await?;
+        Ok(parsed.rows)
+    }
+
+    /// Create a new Dnsmasq DHCP range.
+    pub async fn add_dnsmasq_range(
+        &self,
+        start: &str,
+        end: &str,
+        interface: &str,
+        lease_time: &str,
+        description: &str,
+    ) -> Result<(), Error> {
+        let body = DnsmasqRangePayload {
+            range: DnsmasqRangeData {
+                interface: interface.to_owned(),
+                start_addr: start.to_owned(),
+                end_addr: end.to_owned(),
+                lease_time: lease_time.to_owned(),
+                description: description.to_owned(),
+            },
+        };
+        self.post_json_ok("/api/dnsmasq/settings/addRange", &body, "addRange")
+            .await
+    }
+
+    /// Update an existing Dnsmasq DHCP range by UUID.
+    pub async fn set_dnsmasq_range(
+        &self,
+        uuid: &str,
+        start: &str,
+        end: &str,
+        interface: &str,
+        lease_time: &str,
+        description: &str,
+    ) -> Result<(), Error> {
+        let body = DnsmasqRangePayload {
+            range: DnsmasqRangeData {
+                interface: interface.to_owned(),
+                start_addr: start.to_owned(),
+                end_addr: end.to_owned(),
+                lease_time: lease_time.to_owned(),
+                description: description.to_owned(),
+            },
+        };
+        self.post_json_ok(
+            &format!("/api/dnsmasq/settings/setRange/{uuid}"),
+            &body,
+            &format!("setRange({uuid})"),
+        )
+        .await
+    }
+
+    /// Reconcile the Dnsmasq DHCP range to match the desired config.
+    ///
+    /// Uses marker `[fleet-dns:dhcp-range]` to identify the managed range.
+    /// Creates or updates the range from `config.range_start`/`range_end`.
+    /// Calls `dnsmasq_reconfigure()` after any mutation.
+    pub async fn reconcile_dnsmasq_range(
+        &self,
+        config: &DhcpConfigSpec,
+        dry_run: bool,
+    ) -> Result<ReconcileStats, Error> {
+        let existing = self.search_dnsmasq_ranges().await?;
+        let mut stats = ReconcileStats::default();
+        let marker = dnsmasq_range_marker();
+
+        let lease_time = config
+            .lease_time
+            .map_or_else(|| "3600".to_owned(), |s| s.to_string());
+
+        // Find the existing fleet-dns-managed range, if any.
+        let managed = existing
+            .iter()
+            .find(|r| r.description == marker);
+
+        // Default interface for the LAN DHCP scope.
+        let interface = "lan";
+
+        match managed {
+            Some(range) => {
+                let start_changed = range.start_addr != config.range_start;
+                let end_changed = range.end_addr != config.range_end;
+
+                if start_changed || end_changed {
+                    if dry_run {
+                        info!(
+                            old_start = %range.start_addr,
+                            old_end = %range.end_addr,
+                            new_start = %config.range_start,
+                            new_end = %config.range_end,
+                            "[dry-run] would update Dnsmasq DHCP range"
+                        );
+                    } else {
+                        self.set_dnsmasq_range(
+                            &range.uuid,
+                            &config.range_start,
+                            &config.range_end,
+                            interface,
+                            &lease_time,
+                            &marker,
+                        )
+                        .await?;
+                        info!(
+                            start = %config.range_start,
+                            end = %config.range_end,
+                            uuid = %range.uuid,
+                            "updated Dnsmasq DHCP range"
+                        );
+                    }
+                    stats.updated += 1;
+                } else {
+                    debug!("Dnsmasq DHCP range unchanged");
+                }
+            }
+            None => {
+                if dry_run {
+                    info!(
+                        start = %config.range_start,
+                        end = %config.range_end,
+                        "[dry-run] would create Dnsmasq DHCP range"
+                    );
+                } else {
+                    self.add_dnsmasq_range(
+                        &config.range_start,
+                        &config.range_end,
+                        interface,
+                        &lease_time,
+                        &marker,
+                    )
+                    .await?;
+                    info!(
+                        start = %config.range_start,
+                        end = %config.range_end,
+                        "created Dnsmasq DHCP range"
+                    );
+                }
+                stats.created += 1;
+            }
+        }
+
+        let mutated = stats.created > 0 || stats.updated > 0;
+
+        if mutated && !dry_run {
+            self.dnsmasq_reconfigure().await?;
+            info!("Dnsmasq reconfigured after range update");
+        }
+
+        if mutated {
+            info!(
+                created = stats.created,
+                updated = stats.updated,
+                dry_run,
+                "Dnsmasq DHCP range reconciliation complete"
+            );
+        }
+
+        Ok(stats)
+    }
+
+    // -----------------------------------------------------------------------
     // NAT / Firewall
     // -----------------------------------------------------------------------
 
     /// Search all DNAT rules.
     pub async fn search_dnat_rules(&self) -> Result<Vec<DnatRule>, Error> {
         let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
-        let resp = self
-            .post("/api/firewall/d_nat/search_rule")
-            .json(&body)
-            .send()
+        let parsed: DnatSearchResponse = self
+            .post_json("/api/firewall/d_nat/search_rule", &body, "search_dnat_rule")
             .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "search_dnat_rule returned {status}"
-            )));
-        }
-
-        let parsed: DnatSearchResponse = resp.json().await?;
         Ok(parsed.rows)
     }
 
@@ -572,21 +1134,9 @@ impl OpnSenseClient {
                 descr: description.to_owned(),
             },
         };
-
-        let resp = self
-            .post("/api/firewall/d_nat/add_rule")
-            .json(&body)
-            .send()
+        let parsed: UuidResponse = self
+            .post_json("/api/firewall/d_nat/add_rule", &body, "add_dnat_rule")
             .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "add_dnat_rule returned {status}"
-            )));
-        }
-
-        let parsed: UuidResponse = resp.json().await?;
         parsed.uuid.ok_or_else(|| {
             Error::OpnSense("add_dnat_rule response missing uuid".to_owned())
         })
@@ -594,39 +1144,24 @@ impl OpnSenseClient {
 
     /// Delete a DNAT rule by UUID.
     pub async fn del_dnat_rule(&self, uuid: &str) -> Result<(), Error> {
-        let resp = self
-            .post(&format!("/api/firewall/d_nat/del_rule/{uuid}"))
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "del_dnat_rule({uuid}) returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            &format!("/api/firewall/d_nat/del_rule/{uuid}"),
+            &serde_json::json!({}),
+            &format!("del_dnat_rule({uuid})"),
+        )
+        .await
     }
 
     /// Search all firewall filter rules.
     pub async fn search_filter_rules(&self) -> Result<Vec<FirewallRule>, Error> {
         let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
-        let resp = self
-            .post("/api/firewall/filter/search_rule")
-            .json(&body)
-            .send()
+        let parsed: FirewallSearchResponse = self
+            .post_json(
+                "/api/firewall/filter/search_rule",
+                &body,
+                "search_filter_rule",
+            )
             .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "search_filter_rule returned {status}"
-            )));
-        }
-
-        let parsed: FirewallSearchResponse = resp.json().await?;
         Ok(parsed.rows)
     }
 
@@ -651,21 +1186,9 @@ impl OpnSenseClient {
                 description: description.to_owned(),
             },
         };
-
-        let resp = self
-            .post("/api/firewall/filter/add_rule")
-            .json(&body)
-            .send()
+        let parsed: UuidResponse = self
+            .post_json("/api/firewall/filter/add_rule", &body, "add_filter_rule")
             .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "add_filter_rule returned {status}"
-            )));
-        }
-
-        let parsed: UuidResponse = resp.json().await?;
         parsed.uuid.ok_or_else(|| {
             Error::OpnSense("add_filter_rule response missing uuid".to_owned())
         })
@@ -673,38 +1196,23 @@ impl OpnSenseClient {
 
     /// Delete a firewall filter rule by UUID.
     pub async fn del_filter_rule(&self, uuid: &str) -> Result<(), Error> {
-        let resp = self
-            .post(&format!("/api/firewall/filter/del_rule/{uuid}"))
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "del_filter_rule({uuid}) returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            &format!("/api/firewall/filter/del_rule/{uuid}"),
+            &serde_json::json!({}),
+            &format!("del_filter_rule({uuid})"),
+        )
+        .await
     }
 
     /// Create a firewall savepoint for atomic apply with rollback.
     pub async fn firewall_savepoint(&self) -> Result<String, Error> {
-        let resp = self
-            .post("/api/firewall/d_nat/savepoint")
-            .json(&serde_json::json!({}))
-            .send()
+        let parsed: SavepointResponse = self
+            .post_json(
+                "/api/firewall/d_nat/savepoint",
+                &serde_json::json!({}),
+                "firewall savepoint",
+            )
             .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "firewall savepoint returned {status}"
-            )));
-        }
-
-        let parsed: SavepointResponse = resp.json().await?;
         parsed.revision.ok_or_else(|| {
             Error::OpnSense("savepoint response missing revision".to_owned())
         })
@@ -712,38 +1220,22 @@ impl OpnSenseClient {
 
     /// Apply pending firewall changes.
     pub async fn firewall_apply(&self) -> Result<(), Error> {
-        let resp = self
-            .post("/api/firewall/d_nat/apply")
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "firewall apply returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            "/api/firewall/d_nat/apply",
+            &serde_json::json!({}),
+            "firewall apply",
+        )
+        .await
     }
 
     /// Cancel rollback (confirm the savepoint), making changes permanent.
     pub async fn cancel_rollback(&self, savepoint: &str) -> Result<(), Error> {
-        let resp = self
-            .post(&format!("/api/firewall/d_nat/cancel_rollback/{savepoint}"))
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::OpnSense(format!(
-                "cancel_rollback({savepoint}) returned {status}"
-            )));
-        }
-
-        Ok(())
+        self.post_json_ok(
+            &format!("/api/firewall/d_nat/cancel_rollback/{savepoint}"),
+            &serde_json::json!({}),
+            &format!("cancel_rollback({savepoint})"),
+        )
+        .await
     }
 
     /// Retrieve the WAN IP address from OPNsense interfaces overview.
@@ -1197,5 +1689,150 @@ mod tests {
         let parsed: FirewallSearchResponse =
             serde_json::from_str(json).expect("should deserialize");
         assert_eq!(parsed.rows.len(), 1);
+    }
+
+    #[test]
+    fn dnsmasq_host_marker_format() {
+        assert_eq!(
+            dnsmasq_host_marker("plex.hr-home.xyz"),
+            "[fleet-dns:dhcp:plex.hr-home.xyz]"
+        );
+    }
+
+    #[test]
+    fn dnsmasq_host_deserializes() {
+        let json = r#"{
+            "uuid": "dhcp-001",
+            "host": "plex",
+            "domain": "hr-home.xyz",
+            "ip": "192.168.2.52",
+            "hwaddr": "aa:bb:cc:dd:ee:ff",
+            "descr": "[fleet-dns:dhcp:plex.hr-home.xyz]"
+        }"#;
+
+        let parsed: DnsmasqHost =
+            serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(parsed.uuid, "dhcp-001");
+        assert_eq!(parsed.host, "plex");
+        assert_eq!(parsed.domain, "hr-home.xyz");
+        assert_eq!(parsed.ip, "192.168.2.52");
+        assert_eq!(parsed.hwaddr, "aa:bb:cc:dd:ee:ff");
+        assert!(parsed.descr.starts_with("[fleet-dns:dhcp:"));
+    }
+
+    #[test]
+    fn dnsmasq_host_search_response_deserializes() {
+        let json = r#"{
+            "rows": [
+                {
+                    "uuid": "dhcp-001",
+                    "host": "plex",
+                    "domain": "hr-home.xyz",
+                    "ip": "192.168.2.52",
+                    "hwaddr": "aa:bb:cc:dd:ee:ff",
+                    "descr": "[fleet-dns:dhcp:plex.hr-home.xyz]"
+                }
+            ]
+        }"#;
+
+        let parsed: DnsmasqHostSearchResponse =
+            serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(parsed.rows.len(), 1);
+    }
+
+    // -- DHCP range tests --
+
+    #[test]
+    fn dnsmasq_range_marker_format() {
+        assert_eq!(dnsmasq_range_marker(), "[fleet-dns:dhcp-range]");
+    }
+
+    #[test]
+    fn dnsmasq_range_deserializes() {
+        let json = r#"{
+            "uuid": "range-001",
+            "start_addr": "192.168.2.80",
+            "end_addr": "192.168.2.245",
+            "description": "[fleet-dns:dhcp-range]"
+        }"#;
+
+        let parsed: DnsmasqRange =
+            serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(parsed.uuid, "range-001");
+        assert_eq!(parsed.start_addr, "192.168.2.80");
+        assert_eq!(parsed.end_addr, "192.168.2.245");
+        assert_eq!(parsed.description, "[fleet-dns:dhcp-range]");
+    }
+
+    // -- IP validation tests --
+
+    #[test]
+    fn validate_ip_allocation_no_conflicts() {
+        let conflicts = validate_ip_allocation(
+            &["192.168.2.1-192.168.2.79".to_owned()],
+            &["192.168.2.250".to_owned()],
+            "192.168.2.80",
+            "192.168.2.245",
+        );
+        assert!(conflicts.is_empty(), "expected no conflicts: {conflicts:?}");
+    }
+
+    #[test]
+    fn validate_ip_allocation_reservation_inside_pool() {
+        let conflicts = validate_ip_allocation(
+            &[],
+            &["192.168.2.100".to_owned()],
+            "192.168.2.80",
+            "192.168.2.245",
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert!(
+            conflicts[0].contains("192.168.2.100"),
+            "should mention the conflicting IP: {}",
+            conflicts[0]
+        );
+        assert!(
+            conflicts[0].contains("falls inside DHCP pool"),
+            "should describe the conflict: {}",
+            conflicts[0]
+        );
+    }
+
+    #[test]
+    fn validate_ip_allocation_reserved_range_overlaps_pool() {
+        let conflicts = validate_ip_allocation(
+            &["192.168.2.70-192.168.2.90".to_owned()],
+            &[],
+            "192.168.2.80",
+            "192.168.2.245",
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert!(
+            conflicts[0].contains("overlaps"),
+            "should describe an overlap: {}",
+            conflicts[0]
+        );
+    }
+
+    #[test]
+    fn validate_ip_allocation_reservation_outside_pool() {
+        let conflicts = validate_ip_allocation(
+            &[],
+            &["192.168.2.250".to_owned(), "192.168.2.10".to_owned()],
+            "192.168.2.80",
+            "192.168.2.245",
+        );
+        assert!(conflicts.is_empty(), "expected no conflicts: {conflicts:?}");
+    }
+
+    #[test]
+    fn validate_ip_allocation_empty_inputs() {
+        let conflicts = validate_ip_allocation(
+            &[],
+            &[],
+            "192.168.2.80",
+            "192.168.2.245",
+        );
+        assert!(conflicts.is_empty(), "expected no conflicts: {conflicts:?}");
     }
 }

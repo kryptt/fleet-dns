@@ -57,11 +57,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         discovery::services::start_watcher(kube_client.clone());
     let (policy_store, policy_handle) =
         discovery::policies::start_watcher(kube_client.clone());
+    let (reservation_store, reservation_handle) =
+        discovery::dhcp::start_reservation_watcher(kube_client.clone());
+    let (dhcp_config_store, dhcp_config_handle) =
+        discovery::dhcp::start_config_watcher(kube_client.clone());
 
     tokio::spawn(ingress_handle);
     tokio::spawn(pod_handle);
     tokio::spawn(service_handle);
     tokio::spawn(policy_handle);
+    tokio::spawn(reservation_handle);
+    tokio::spawn(dhcp_config_handle);
 
     // 8. Build target clients.
     let cloudflare = CloudflareClient::new(
@@ -89,6 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pod_store.clone(),
         service_store.clone(),
         policy_store.clone(),
+        reservation_store.clone(),
+        dhcp_config_store.clone(),
     ));
 
     // 10. Start HTTP server.

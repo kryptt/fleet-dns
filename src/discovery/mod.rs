@@ -1,3 +1,4 @@
+pub mod dhcp;
 pub mod ingress;
 pub mod pods;
 pub mod policies;
@@ -25,6 +26,7 @@ pub struct MultusNetwork {
 ///
 /// Returns `None` (with a log warning) on any parse error, missing network, or
 /// missing/unparseable IP. Never panics.
+#[must_use]
 pub fn parse_multus_ip(annotation: &str, network_name: &str) -> Option<IpAddr> {
     let networks: Vec<MultusNetwork> = match serde_json::from_str(annotation) {
         Ok(v) => v,

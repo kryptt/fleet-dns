@@ -8,13 +8,13 @@ use kube::Client;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::crd::CoreDnsPolicy;
+use crate::crd::{CoreDnsPolicy, DhcpConfig, DhcpReservation};
 use crate::error::Error;
 use crate::metrics::{error_label, target_label, Metrics};
-use crate::state::{build_desired_state, diff, DnsState};
+use crate::state::{build_desired_state, diff, merge_dhcp_reservations, DnsState};
 use crate::targets::cloudflare::CloudflareClient;
 use crate::targets::coredns;
-use crate::targets::opnsense::OpnSenseClient;
+use crate::targets::opnsense::{validate_ip_allocation, DhcpHostEntry, OpnSenseClient};
 use crate::traefik::IngressRoute;
 
 /// The main reconciliation orchestrator.
@@ -31,6 +31,8 @@ pub struct Reconciler {
     pod_store: Store<Pod>,
     service_store: Store<Service>,
     policy_store: Store<CoreDnsPolicy>,
+    reservation_store: Store<DhcpReservation>,
+    dhcp_config_store: Store<DhcpConfig>,
     current_state: Mutex<DnsState>,
     wan_ip: Mutex<Option<IpAddr>>,
 }
@@ -48,6 +50,8 @@ impl Reconciler {
         pod_store: Store<Pod>,
         service_store: Store<Service>,
         policy_store: Store<CoreDnsPolicy>,
+        reservation_store: Store<DhcpReservation>,
+        dhcp_config_store: Store<DhcpConfig>,
     ) -> Self {
         Self {
             config,
@@ -59,6 +63,8 @@ impl Reconciler {
             pod_store,
             service_store,
             policy_store,
+            reservation_store,
+            dhcp_config_store,
             current_state: Mutex::new(DnsState::new()),
             wan_ip: Mutex::new(None),
         }
@@ -66,10 +72,11 @@ impl Reconciler {
 
     /// Execute a single reconciliation pass.
     ///
-    /// Ordering: NAT -> Unbound -> CoreDNS -> Cloudflare.
+    /// Ordering: NAT -> Unbound -> CoreDNS -> Cloudflare -> Dnsmasq.
     /// - CoreDNS and Unbound always run (internal targets).
     /// - If NAT fails, Cloudflare is skipped (prevents exposing records
     ///   without matching port forwards).
+    /// - Dnsmasq always runs (DHCP is independent of DNS/NAT success).
     pub async fn run_once(&self) -> Result<(), Error> {
         let start = Instant::now();
         self.metrics.reconciliations_total.inc();
@@ -103,7 +110,12 @@ impl Reconciler {
         let traefik_ip = find_traefik_ip(&pods)?;
 
         // 3. Build desired state.
-        let desired = build_desired_state(&ingresses, &pods, &services, traefik_ip);
+        let mut desired = build_desired_state(&ingresses, &pods, &services, traefik_ip);
+
+        // 3b. Merge DHCP reservations into DNS state.
+        let reservations: Vec<_> = self.reservation_store.state();
+        let all_reservations = merge_dhcp_reservations(&mut desired, &reservations);
+        let dhcp_configs: Vec<_> = self.dhcp_config_store.state();
 
         // 4. Get current WAN IP from OPNsense.
         let wan_ip = self
@@ -233,6 +245,87 @@ impl Reconciler {
                 }
             }
         }
+
+        // -- Dnsmasq (DHCP host reservations + range) --
+        let host_entries: Vec<DhcpHostEntry> = all_reservations
+            .iter()
+            .map(|r| DhcpHostEntry {
+                hostname: r.spec.hostname.clone(),
+                ip: r.spec.ip.clone(),
+                mac: r.spec.mac.clone(),
+            })
+            .collect();
+
+        match self
+            .opnsense
+            .reconcile_dnsmasq_hosts(&host_entries, self.config.dry_run)
+            .await
+        {
+            Ok(stats) => {
+                let total = stats.created + stats.updated + stats.deleted;
+                self.metrics
+                    .records_managed
+                    .get_or_create(&target_label("dnsmasq"))
+                    .set(total.into());
+            }
+            Err(e) => {
+                warn!(error = %e, "Dnsmasq host reconciliation failed");
+                self.metrics
+                    .errors_total
+                    .get_or_create(&error_label("dnsmasq_hosts"))
+                    .inc();
+            }
+        }
+
+        if let Some(dhcp_config) = dhcp_configs.first() {
+            let reservation_ips: Vec<String> =
+                reservations.iter().map(|r| r.spec.ip.clone()).collect();
+            let conflicts = validate_ip_allocation(
+                &dhcp_config.spec.reserved_ranges,
+                &reservation_ips,
+                &dhcp_config.spec.range_start,
+                &dhcp_config.spec.range_end,
+            );
+
+            if !conflicts.is_empty() {
+                for conflict in &conflicts {
+                    error!(conflict = %conflict, "IP allocation conflict detected");
+                }
+                self.metrics.ip_conflicts_total.inc_by(conflicts.len() as u64);
+            } else {
+                match self
+                    .opnsense
+                    .reconcile_dnsmasq_range(&dhcp_config.spec, self.config.dry_run)
+                    .await
+                {
+                    Ok(_stats) => {}
+                    Err(e) => {
+                        warn!(error = %e, "Dnsmasq range reconciliation failed");
+                        self.metrics
+                            .errors_total
+                            .get_or_create(&error_label("dnsmasq_range"))
+                            .inc();
+                    }
+                }
+            }
+
+            // Update pool size metric (range_end - range_start + 1).
+            if let (Some(start), Some(end)) = (
+                crate::targets::opnsense::parse_ipv4_octets(&dhcp_config.spec.range_start),
+                crate::targets::opnsense::parse_ipv4_octets(&dhcp_config.spec.range_end),
+            ) {
+                let s = crate::targets::opnsense::octets_to_u32(start);
+                let e = crate::targets::opnsense::octets_to_u32(end);
+                if e >= s {
+                    self.metrics.dhcp_pool_size.set((e - s + 1) as i64);
+                }
+            }
+        }
+
+        // Update DHCP reservations gauge.
+        self.metrics
+            .dhcp_reservations_total
+            .set(all_reservations.len() as i64);
 
         // 7. Update cached current state.
         *self.current_state.lock().expect("state mutex poisoned") = desired;

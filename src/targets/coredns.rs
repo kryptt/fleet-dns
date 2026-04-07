@@ -176,6 +176,7 @@ mod tests {
             reconcile_interval: Duration::from_secs(300),
             managed: true,
             source: "test/test".to_owned(),
+            unbound_alias_target: None,
         }
     }
 

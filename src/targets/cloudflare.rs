@@ -530,6 +530,7 @@ mod tests {
                 reconcile_interval: Duration::from_secs(300),
                 managed: true,
                 source: "test/managed".to_owned(),
+                unbound_alias_target: None,
             },
             DnsEntry {
                 hostname: "skipped.hr-home.xyz".to_owned(),
@@ -541,6 +542,7 @@ mod tests {
                 reconcile_interval: Duration::from_secs(300),
                 managed: true,
                 source: "test/skipped".to_owned(),
+                unbound_alias_target: None,
             },
             DnsEntry {
                 hostname: "unmanaged.hr-home.xyz".to_owned(),
@@ -552,6 +554,7 @@ mod tests {
                 reconcile_interval: Duration::from_secs(300),
                 managed: false,
                 source: "test/unmanaged".to_owned(),
+                unbound_alias_target: None,
             },
         ];
 

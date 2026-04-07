@@ -122,6 +122,39 @@ struct UnboundHostData {
 }
 
 // ---------------------------------------------------------------------------
+// Unbound host alias wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct UnboundAliasSearchResponse {
+    rows: Vec<UnboundHostAlias>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnboundHostAlias {
+    pub uuid: String,
+    pub hostname: String,
+    pub domain: String,
+    pub description: String,
+    #[allow(dead_code)]
+    pub enabled: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UnboundAliasPayload {
+    alias: UnboundAliasData,
+}
+
+#[derive(Debug, Serialize)]
+struct UnboundAliasData {
+    enabled: String,
+    host: String, // UUID of parent host override
+    hostname: String,
+    domain: String,
+    description: String,
+}
+
+// ---------------------------------------------------------------------------
 // Firewall / NAT wire types
 // ---------------------------------------------------------------------------
 
@@ -570,43 +603,145 @@ impl OpnSenseClient {
         .await
     }
 
-    /// Reconcile Unbound host overrides to match the desired DNS entries.
+    // -----------------------------------------------------------------------
+    // Unbound host aliases
+    // -----------------------------------------------------------------------
+
+    /// Search all host aliases, filtering by the fleet-dns marker prefix.
+    pub async fn search_host_aliases(&self) -> Result<Vec<UnboundHostAlias>, Error> {
+        let body = serde_json::json!({"searchPhrase": MARKER_PREFIX});
+        let parsed: UnboundAliasSearchResponse = self
+            .post_json(
+                "/api/unbound/settings/searchHostAlias",
+                &body,
+                "searchHostAlias",
+            )
+            .await?;
+        Ok(parsed.rows)
+    }
+
+    /// Create a new host alias attached to a parent host override.
+    pub async fn add_host_alias(
+        &self,
+        parent_uuid: &str,
+        hostname: &str,
+        domain: &str,
+        description: &str,
+    ) -> Result<(), Error> {
+        let body = UnboundAliasPayload {
+            alias: UnboundAliasData {
+                enabled: "1".to_owned(),
+                host: parent_uuid.to_owned(),
+                hostname: hostname.to_owned(),
+                domain: domain.to_owned(),
+                description: description.to_owned(),
+            },
+        };
+        self.post_json_ok(
+            "/api/unbound/settings/addHostAlias",
+            &body,
+            "addHostAlias",
+        )
+        .await
+    }
+
+    /// Update an existing host alias by UUID.
+    pub async fn set_host_alias(
+        &self,
+        uuid: &str,
+        parent_uuid: &str,
+        hostname: &str,
+        domain: &str,
+        description: &str,
+    ) -> Result<(), Error> {
+        let body = UnboundAliasPayload {
+            alias: UnboundAliasData {
+                enabled: "1".to_owned(),
+                host: parent_uuid.to_owned(),
+                hostname: hostname.to_owned(),
+                domain: domain.to_owned(),
+                description: description.to_owned(),
+            },
+        };
+        self.post_json_ok(
+            &format!("/api/unbound/settings/setHostAlias/{uuid}"),
+            &body,
+            &format!("setHostAlias({uuid})"),
+        )
+        .await
+    }
+
+    /// Delete a host alias by UUID.
+    pub async fn del_host_alias(&self, uuid: &str) -> Result<(), Error> {
+        self.post_json_ok(
+            &format!("/api/unbound/settings/delHostAlias/{uuid}"),
+            &serde_json::json!({}),
+            &format!("delHostAlias({uuid})"),
+        )
+        .await
+    }
+
+    /// Reconcile Unbound host overrides and host aliases to match desired DNS
+    /// entries.
     ///
-    /// Only entries with `managed == true` are considered. The effective IP is
-    /// `macvlan_ip` when present, otherwise `lan_ip`.
+    /// Two-phase approach:
+    /// - **Phase 1 (A records):** entries where `unbound_alias_target` is `None`
+    ///   become direct host overrides. This includes the anchor
+    ///   (`ha.hr-home.xyz`), DHCP entries, and `-direct` macvlan entries.
+    /// - **Phase 2 (aliases):** entries where `unbound_alias_target` is `Some`
+    ///   become host aliases linked to the anchor override from Phase 1.
+    ///
+    /// Orphaned overrides and aliases managed by fleet-dns are deleted.
     pub async fn reconcile_unbound(
         &self,
         entries: &[DnsEntry],
         dry_run: bool,
     ) -> Result<ReconcileStats, Error> {
-        let existing = self.search_host_overrides().await?;
+        let existing_overrides = self.search_host_overrides().await?;
+        let existing_aliases = self.search_host_aliases().await?;
         let mut stats = ReconcileStats::default();
 
         // Index existing fleet-dns overrides by their marker payload (the FQDN).
-        let existing_by_marker: HashMap<&str, &UnboundHostOverride> = existing
+        let existing_by_marker: HashMap<&str, &UnboundHostOverride> = existing_overrides
             .iter()
             .filter_map(|o| {
                 extract_marker_payload(&o.description).map(|payload| (payload, o))
             })
             .collect();
 
-        let mut accounted: HashSet<String> = HashSet::with_capacity(entries.len());
+        // Index existing fleet-dns aliases by their marker payload.
+        let aliases_by_marker: HashMap<&str, &UnboundHostAlias> = existing_aliases
+            .iter()
+            .filter_map(|a| {
+                extract_marker_payload(&a.description).map(|payload| (payload, a))
+            })
+            .collect();
 
-        for entry in entries {
-            if !entry.managed {
-                stats.skipped += 1;
-                continue;
-            }
+        // Partition entries into A-record and alias groups.
+        let (a_record_entries, alias_entries): (Vec<&DnsEntry>, Vec<&DnsEntry>) = entries
+            .iter()
+            .filter(|e| e.managed)
+            .partition(|e| e.unbound_alias_target.is_none());
 
-            let ip = entry.macvlan_ip.unwrap_or(entry.lan_ip);
+        let skipped = entries.iter().filter(|e| !e.managed).count() as u32;
+        stats.skipped += skipped;
+
+        // Track which markers are desired (for orphan cleanup).
+        let mut accounted_overrides: HashSet<String> =
+            HashSet::with_capacity(a_record_entries.len());
+        let mut accounted_aliases: HashSet<String> =
+            HashSet::with_capacity(alias_entries.len());
+
+        // -- Phase 1: A records --
+        for entry in &a_record_entries {
+            let ip = entry.lan_ip;
             let (host, domain) = split_hostname(&entry.hostname);
             let marker = unbound_marker(&entry.hostname);
 
-            accounted.insert(entry.hostname.clone());
+            accounted_overrides.insert(entry.hostname.clone());
 
             match existing_by_marker.get(entry.hostname.as_str()) {
                 Some(override_entry) => {
-                    // Check whether the IP has changed.
                     if override_entry.server != ip.to_string() {
                         if dry_run {
                             info!(
@@ -657,14 +792,94 @@ impl OpnSenseClient {
             }
         }
 
-        // Delete orphaned overrides that fleet-dns manages but no longer desires.
-        for override_entry in &existing {
+        // -- Phase 2: host aliases --
+        // Find the anchor override UUID (needed as parent for all aliases).
+        // Re-fetch overrides if we just created the anchor in Phase 1.
+        let anchor_uuid = if let Some(existing) =
+            existing_by_marker.get(crate::UNBOUND_ANCHOR)
+        {
+            Some(existing.uuid.clone())
+        } else if !dry_run {
+            // Anchor was just created — re-fetch to get its UUID.
+            let refreshed = self.search_host_overrides().await?;
+            refreshed
+                .iter()
+                .find(|o| {
+                    extract_marker_payload(&o.description) == Some(crate::UNBOUND_ANCHOR)
+                })
+                .map(|o| o.uuid.clone())
+        } else {
+            None
+        };
+
+        if !alias_entries.is_empty() {
+            match &anchor_uuid {
+                Some(parent_uuid) => {
+                    for entry in &alias_entries {
+                        let (host, domain) = split_hostname(&entry.hostname);
+                        let marker = unbound_marker(&entry.hostname);
+
+                        accounted_aliases.insert(entry.hostname.clone());
+
+                        match aliases_by_marker.get(entry.hostname.as_str()) {
+                            Some(_existing_alias) => {
+                                // Alias exists — host aliases don't have an IP to
+                                // compare, so as long as it exists we're good.
+                                debug!(
+                                    hostname = %entry.hostname,
+                                    "Unbound host alias unchanged"
+                                );
+                            }
+                            None => {
+                                if dry_run {
+                                    info!(
+                                        hostname = %entry.hostname,
+                                        anchor = crate::UNBOUND_ANCHOR,
+                                        "[dry-run] would create Unbound host alias"
+                                    );
+                                } else {
+                                    self.add_host_alias(
+                                        parent_uuid,
+                                        host,
+                                        domain,
+                                        &marker,
+                                    )
+                                    .await?;
+                                    info!(
+                                        hostname = %entry.hostname,
+                                        anchor = crate::UNBOUND_ANCHOR,
+                                        "created Unbound host alias"
+                                    );
+                                }
+                                stats.created += 1;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        "anchor override {} not found; skipping {} alias entries",
+                        crate::UNBOUND_ANCHOR,
+                        alias_entries.len()
+                    );
+                    stats.skipped += alias_entries.len() as u32;
+                }
+            }
+        }
+
+        // -- Cleanup: delete orphaned overrides --
+        // Overrides that fleet-dns manages but are no longer desired as A records,
+        // AND are not targets of aliases (i.e., they've been migrated to aliases).
+        for override_entry in &existing_overrides {
             let payload = match extract_marker_payload(&override_entry.description) {
                 Some(p) => p,
                 None => continue,
             };
 
-            if !accounted.contains(payload) {
+            if !accounted_overrides.contains(payload) {
+                // Only delete if this hostname isn't now an alias entry either
+                // (it's a stale A record being replaced by an alias, which will
+                // be created above; the old A record must go).
                 if dry_run {
                     info!(
                         hostname = payload,
@@ -677,6 +892,32 @@ impl OpnSenseClient {
                         hostname = payload,
                         uuid = %override_entry.uuid,
                         "deleted orphaned Unbound host override"
+                    );
+                }
+                stats.deleted += 1;
+            }
+        }
+
+        // -- Cleanup: delete orphaned aliases --
+        for alias_entry in &existing_aliases {
+            let payload = match extract_marker_payload(&alias_entry.description) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if !accounted_aliases.contains(payload) {
+                if dry_run {
+                    info!(
+                        hostname = payload,
+                        uuid = %alias_entry.uuid,
+                        "[dry-run] would delete orphaned Unbound host alias"
+                    );
+                } else {
+                    self.del_host_alias(&alias_entry.uuid).await?;
+                    info!(
+                        hostname = payload,
+                        uuid = %alias_entry.uuid,
+                        "deleted orphaned Unbound host alias"
                     );
                 }
                 stats.deleted += 1;

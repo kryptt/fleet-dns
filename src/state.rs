@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::crd::DhcpReservation;
 use crate::discovery::parse_multus_ip;
 use crate::traefik::{extract_hostnames, IngressRoute};
-use crate::{MANAGED_ZONE, ZONE};
+use crate::{MANAGED_ZONE, UNBOUND_ANCHOR, ZONE};
 
 /// The Multus network attachment name used for LAN macvlan interfaces.
 const MACVLAN_NETWORK: &str = "lan-macvlan";
@@ -60,6 +60,9 @@ pub struct DnsEntry {
     pub reconcile_interval: Duration,
     pub managed: bool,
     pub source: String,
+    /// When set, this entry becomes an Unbound host alias pointing to the given
+    /// anchor hostname (e.g., "ha.hr-home.xyz") instead of a direct A record.
+    pub unbound_alias_target: Option<String>,
 }
 
 /// Per-target change sets produced by [`diff`].
@@ -346,7 +349,74 @@ pub fn build_desired_state(
             reconcile_interval,
             managed,
             source,
+            unbound_alias_target: None,
         });
+    }
+
+    // Post-process: make all IngressRoute entries into Unbound aliases
+    // pointing to the anchor, except the anchor itself. For entries with
+    // macvlan IPs, emit additional `{name}-direct` A records.
+    if state.is_empty() {
+        return state;
+    }
+
+    let anchor = UNBOUND_ANCHOR.to_owned();
+
+    // Ensure the anchor entry exists as an A record.
+    if !state.contains_key(&anchor) {
+        state.insert(anchor.clone(), DnsEntry {
+            hostname: anchor.clone(),
+            lan_ip: traefik_ip,
+            macvlan_ip: None,
+            cloudflare_mode: CloudflareMode::Skip,
+            wan_expose: WanExpose::Skip,
+            dns_ttl: Duration::from_secs(300),
+            reconcile_interval: Duration::from_secs(300),
+            managed: true,
+            source: "synthetic/unbound-anchor".to_owned(),
+            unbound_alias_target: None,
+        });
+    }
+
+    // Collect direct entries to add (can't mutate state while iterating).
+    let mut direct_entries: Vec<DnsEntry> = Vec::new();
+
+    for entry in state.values_mut() {
+        if entry.hostname == anchor {
+            // The anchor stays as an A record pointing to traefik_ip.
+            // Drop the macvlan_ip — the anchor's purpose is to hold
+            // traefik_ip; no -direct needed since both resolve the same way.
+            entry.macvlan_ip = None;
+            continue;
+        }
+
+        // All other IngressRoute entries become aliases.
+        entry.unbound_alias_target = Some(anchor.clone());
+
+        // Only emit -direct when the macvlan IP differs from lan_ip
+        // (traefik_ip). If they're the same there's no conflict.
+        if let Some(mvip) = entry.macvlan_ip.filter(|&ip| ip != entry.lan_ip) {
+            let direct_host = format!(
+                "{}-direct.{ZONE}",
+                entry.hostname.strip_suffix(&format!(".{ZONE}")).unwrap_or(&entry.hostname)
+            );
+            direct_entries.push(DnsEntry {
+                hostname: direct_host,
+                lan_ip: mvip,
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Skip,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: entry.dns_ttl,
+                reconcile_interval: entry.reconcile_interval,
+                managed: true,
+                source: format!("{}/direct", entry.source),
+                unbound_alias_target: None,
+            });
+        }
+    }
+
+    for de in direct_entries {
+        state.insert(de.hostname.clone(), de);
     }
 
     state
@@ -442,6 +512,7 @@ pub fn merge_dhcp_reservations(
             reconcile_interval: Duration::from_secs(300),
             managed: true,
             source: format!("dhcp/{}", reservation.spec.hostname),
+            unbound_alias_target: None,
         });
 
         result.push(Arc::clone(reservation));
@@ -576,7 +647,7 @@ mod tests {
     // ---- Tests ----
 
     #[test]
-    fn macvlan_pod_gets_macvlan_ip_and_traefik_lan_ip() {
+    fn macvlan_pod_gets_alias_and_direct_entry() {
         let ir = make_ingress_route(
             "home",
             "hass",
@@ -604,17 +675,32 @@ mod tests {
             traefik_ip(),
         );
 
+        // Main entry becomes an alias to the anchor.
         let entry = state.get("hass.hr-home.xyz").expect("entry must exist");
         assert_eq!(entry.lan_ip, traefik_ip());
-        assert_eq!(
-            entry.macvlan_ip,
-            Some("192.168.2.51".parse().unwrap())
-        );
+        assert_eq!(entry.macvlan_ip, Some("192.168.2.51".parse().unwrap()));
         assert!(entry.managed);
+        assert_eq!(
+            entry.unbound_alias_target,
+            Some(crate::UNBOUND_ANCHOR.to_owned())
+        );
+
+        // Direct entry is emitted for the macvlan IP.
+        let direct = state.get("hass-direct.hr-home.xyz").expect("direct entry must exist");
+        assert_eq!(direct.lan_ip, "192.168.2.51".parse::<IpAddr>().unwrap());
+        assert_eq!(direct.macvlan_ip, None);
+        assert!(direct.managed);
+        assert_eq!(direct.unbound_alias_target, None);
+
+        // Anchor entry is synthesized.
+        let anchor = state.get(crate::UNBOUND_ANCHOR).expect("anchor must exist");
+        assert_eq!(anchor.lan_ip, traefik_ip());
+        assert_eq!(anchor.unbound_alias_target, None);
+        assert!(anchor.managed);
     }
 
     #[test]
-    fn no_macvlan_pod_gets_none_macvlan_ip() {
+    fn no_macvlan_pod_gets_alias_no_direct() {
         let ir = make_ingress_route(
             "media",
             "plex",
@@ -640,6 +726,12 @@ mod tests {
         let entry = state.get("plex.hr-home.xyz").unwrap();
         assert_eq!(entry.lan_ip, traefik_ip());
         assert_eq!(entry.macvlan_ip, None);
+        assert_eq!(
+            entry.unbound_alias_target,
+            Some(crate::UNBOUND_ANCHOR.to_owned())
+        );
+        // No -direct entry since no macvlan IP.
+        assert!(state.get("plex-direct.hr-home.xyz").is_none());
     }
 
     #[test]
@@ -811,6 +903,7 @@ mod tests {
             reconcile_interval: Duration::from_secs(300),
             managed: true,
             source: "system/old".to_owned(),
+            unbound_alias_target: None,
         });
         current.insert("same.hr-home.xyz".to_owned(), DnsEntry {
             hostname: "same.hr-home.xyz".to_owned(),
@@ -822,6 +915,7 @@ mod tests {
             reconcile_interval: Duration::from_secs(300),
             managed: true,
             source: "system/same".to_owned(),
+            unbound_alias_target: None,
         });
         current.insert("changed.hr-home.xyz".to_owned(), DnsEntry {
             hostname: "changed.hr-home.xyz".to_owned(),
@@ -833,6 +927,7 @@ mod tests {
             reconcile_interval: Duration::from_secs(300),
             managed: false, // was false
             source: "system/changed".to_owned(),
+            unbound_alias_target: None,
         });
 
         let mut desired = DnsState::new();
@@ -848,6 +943,7 @@ mod tests {
             reconcile_interval: Duration::from_secs(300),
             managed: true,
             source: "system/same".to_owned(),
+            unbound_alias_target: None,
         });
         // "changed" has managed flipped -> update
         desired.insert("changed.hr-home.xyz".to_owned(), DnsEntry {
@@ -860,6 +956,7 @@ mod tests {
             reconcile_interval: Duration::from_secs(300),
             managed: true, // changed to true
             source: "system/changed".to_owned(),
+            unbound_alias_target: None,
         });
         // "new" is added
         desired.insert("new.hr-home.xyz".to_owned(), DnsEntry {
@@ -872,6 +969,7 @@ mod tests {
             reconcile_interval: Duration::from_secs(300),
             managed: true,
             source: "system/new".to_owned(),
+            unbound_alias_target: None,
         });
 
         let changes = diff(&desired, &current);
@@ -1034,6 +1132,71 @@ mod tests {
 
         let entry = state.get("registry.hr-home.xyz").unwrap();
         assert_eq!(entry.wan_expose, WanExpose::Skip);
+    }
+
+    #[test]
+    fn anchor_ingressroute_stays_as_a_record_no_direct() {
+        // When the anchor hostname (ha.hr-home.xyz) is a real IngressRoute
+        // with a macvlan IP, it stays as an A record pointing to traefik_ip.
+        // No -direct entry needed — the anchor IS the traefik_ip record.
+        let ir = make_ingress_route(
+            "home",
+            "ha",
+            &format!("Host(`{}`)", crate::UNBOUND_ANCHOR),
+            "ha-svc",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+        let svc = make_service(
+            "home",
+            "ha-svc",
+            labels(&[("app", "ha")]),
+            vec![(8123, "TCP")],
+        );
+        let pod = make_pod(
+            "home",
+            "ha-pod",
+            labels(&[("app", "ha")]),
+            Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.50/24"]}]"#),
+        );
+
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+
+        // Anchor is an A record (no alias target), pointing to traefik_ip.
+        let anchor = state.get(crate::UNBOUND_ANCHOR).expect("anchor must exist");
+        assert_eq!(anchor.lan_ip, traefik_ip());
+        assert_eq!(anchor.macvlan_ip, None);
+        assert_eq!(anchor.unbound_alias_target, None);
+        assert!(anchor.managed);
+
+        // No -direct entry for the anchor itself.
+        assert!(state.get("ha-direct.hr-home.xyz").is_none());
+    }
+
+    #[test]
+    fn synthetic_anchor_created_when_no_ha_ingressroute() {
+        let ir = make_ingress_route(
+            "media",
+            "plex",
+            "Host(`plex.hr-home.xyz`)",
+            "plex-svc",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+
+        // Anchor is injected synthetically.
+        let anchor = state.get(crate::UNBOUND_ANCHOR).expect("anchor must exist");
+        assert_eq!(anchor.lan_ip, traefik_ip());
+        assert_eq!(anchor.unbound_alias_target, None);
+        assert!(anchor.managed);
+        assert_eq!(anchor.source, "synthetic/unbound-anchor");
+
+        // Plex entry is an alias.
+        let entry = state.get("plex.hr-home.xyz").unwrap();
+        assert_eq!(
+            entry.unbound_alias_target,
+            Some(crate::UNBOUND_ANCHOR.to_owned())
+        );
     }
 
     // ---- DHCP reservation merge tests ----

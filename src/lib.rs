@@ -14,6 +14,10 @@ pub const MANAGED_ZONE: &str = ".hr-home.xyz";
 /// The bare zone name (without leading dot).
 pub const ZONE: &str = "hr-home.xyz";
 
+/// The Unbound anchor hostname. All Traefik IngressRoute hostnames become
+/// host aliases pointing to this A record, which holds the Traefik macvlan IP.
+pub const UNBOUND_ANCHOR: &str = "ha.hr-home.xyz";
+
 /// Statistics from a single reconciliation pass against any target.
 #[derive(Debug, Default)]
 pub struct ReconcileStats {

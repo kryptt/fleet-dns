@@ -85,6 +85,74 @@ pub struct DhcpConfigSpec {
     pub reserved_ranges: Vec<String>,
 }
 
+/// Spec for an OidcApplication custom resource.
+///
+/// Declares a Zitadel OIDC application and its corresponding Traefik
+/// Middleware. Fleet-dns syncs redirect URIs from IngressRoutes labeled
+/// with `hr-home.xyz/oidc: "<name>"` and manages the Zitadel app +
+/// Traefik Middleware lifecycle.
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "fleet-dns.hr-home.xyz",
+    version = "v1",
+    kind = "OidcApplication",
+    namespaced,
+    status = "OidcApplicationStatus"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct OidcApplicationSpec {
+    /// Zitadel project name (resolved to project ID at runtime).
+    pub project_name: String,
+
+    /// Name of the OIDC application in Zitadel.
+    pub app_name: String,
+
+    /// Traefik Middleware configuration.
+    pub middleware: OidcMiddlewareSpec,
+
+    /// Extra redirect URIs beyond those auto-synced from IngressRoutes
+    /// (e.g. Postman OAuth callback).
+    #[serde(default)]
+    pub extra_redirect_uris: Vec<String>,
+}
+
+/// Configuration for the Traefik OIDC Middleware that fleet-dns manages.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OidcMiddlewareSpec {
+    /// Middleware resource name.
+    pub name: String,
+
+    /// Namespace for the Middleware resource.
+    pub namespace: String,
+
+    /// OIDC scopes to request (e.g. `["openid", "profile", "email"]`).
+    pub scopes: Vec<String>,
+}
+
+/// Status of an OidcApplication, updated by fleet-dns after reconciliation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct OidcApplicationStatus {
+    /// Zitadel project ID (resolved from `project_name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+
+    /// Zitadel OIDC application ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+
+    /// OIDC client ID (used in the Traefik Middleware).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+
+    /// Redirect URIs last synced to Zitadel.
+    #[serde(default)]
+    pub synced_redirect_uris: Vec<String>,
+
+    /// ISO 8601 timestamp of the last successful sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +192,49 @@ mod tests {
         assert_eq!(spec.ip, "192.168.2.100");
         assert_eq!(spec.hostname, "my-host");
         assert_eq!(spec.description.as_deref(), Some("Living room AP"));
+    }
+
+    #[test]
+    fn oidc_application_crd_has_correct_group_and_kind() {
+        let crd = OidcApplication::crd();
+        assert_eq!(crd.spec.group, "fleet-dns.hr-home.xyz");
+        assert_eq!(crd.spec.names.kind, "OidcApplication");
+    }
+
+    #[test]
+    fn oidc_application_spec_deserializes() {
+        let json = serde_json::json!({
+            "projectName": "Home Services",
+            "appName": "system-oidc",
+            "middleware": {
+                "name": "system-oidc",
+                "namespace": "ingress",
+                "scopes": ["openid", "profile", "email"]
+            },
+            "extraRedirectUris": ["https://oauth.pstmn.io/v1/callback"]
+        });
+        let spec: OidcApplicationSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.project_name, "Home Services");
+        assert_eq!(spec.app_name, "system-oidc");
+        assert_eq!(spec.middleware.name, "system-oidc");
+        assert_eq!(spec.middleware.namespace, "ingress");
+        assert_eq!(spec.middleware.scopes, vec!["openid", "profile", "email"]);
+        assert_eq!(spec.extra_redirect_uris, vec!["https://oauth.pstmn.io/v1/callback"]);
+    }
+
+    #[test]
+    fn oidc_application_spec_deserializes_without_extras() {
+        let json = serde_json::json!({
+            "projectName": "Home",
+            "appName": "test-oidc",
+            "middleware": {
+                "name": "test-oidc",
+                "namespace": "ingress",
+                "scopes": ["openid"]
+            }
+        });
+        let spec: OidcApplicationSpec = serde_json::from_value(json).unwrap();
+        assert!(spec.extra_redirect_uris.is_empty());
     }
 
     #[test]

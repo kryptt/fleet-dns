@@ -17,6 +17,9 @@ pub enum Error {
 
     #[error("cloudflare error: {0}")]
     Cloudflare(String),
+
+    #[error("zitadel error: {0}")]
+    Zitadel(String),
 }
 
 impl Error {
@@ -30,6 +33,7 @@ impl Error {
             Error::Config(_) => "config",
             Error::OpnSense(_) => "opnsense",
             Error::Cloudflare(_) => "cloudflare",
+            Error::Zitadel(_) => "zitadel",
         }
     }
 }

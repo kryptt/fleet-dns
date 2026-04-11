@@ -3,6 +3,7 @@ pub mod crd;
 pub mod discovery;
 pub mod error;
 pub mod metrics;
+pub mod oidc_state;
 pub mod reconciler;
 pub mod state;
 pub mod targets;

@@ -557,6 +557,7 @@ mod tests {
                         name: svc_name.to_owned(),
                         namespace: Some(namespace.to_owned()),
                     }]),
+                    middlewares: None,
                 }],
             },
         })

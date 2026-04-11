@@ -34,6 +34,19 @@ pub struct IngressRouteRoute {
 
     #[serde(default)]
     pub services: Option<Vec<IngressRouteService>>,
+
+    /// Middleware references applied to this route.
+    #[serde(default)]
+    pub middlewares: Option<Vec<IngressRouteMiddlewareRef>>,
+}
+
+/// Reference to a Traefik Middleware from an IngressRoute route.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IngressRouteMiddlewareRef {
+    pub name: String,
+
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -8,13 +8,15 @@ use kube::Client;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::crd::{CoreDnsPolicy, DhcpConfig, DhcpReservation};
+use crate::crd::{CoreDnsPolicy, DhcpConfig, DhcpReservation, OidcApplication};
 use crate::error::Error;
 use crate::metrics::{error_label, target_label, Metrics};
+use crate::oidc_state::build_oidc_desired;
 use crate::state::{build_desired_state, diff, merge_dhcp_reservations, DnsState};
 use crate::targets::cloudflare::CloudflareClient;
 use crate::targets::coredns;
 use crate::targets::opnsense::{validate_ip_allocation, DhcpHostEntry, OpnSenseClient};
+use crate::targets::zitadel::ZitadelClient;
 use crate::traefik::IngressRoute;
 
 /// The main reconciliation orchestrator.
@@ -26,6 +28,7 @@ pub struct Reconciler {
     kube_client: Client,
     cloudflare: CloudflareClient,
     opnsense: OpnSenseClient,
+    zitadel: Option<ZitadelClient>,
     metrics: Metrics,
     ingress_store: Store<IngressRoute>,
     pod_store: Store<Pod>,
@@ -33,6 +36,7 @@ pub struct Reconciler {
     policy_store: Store<CoreDnsPolicy>,
     reservation_store: Store<DhcpReservation>,
     dhcp_config_store: Store<DhcpConfig>,
+    oidc_store: Option<Store<OidcApplication>>,
     current_state: Mutex<DnsState>,
     wan_ip: Mutex<Option<IpAddr>>,
 }
@@ -45,6 +49,7 @@ impl Reconciler {
         kube_client: Client,
         cloudflare: CloudflareClient,
         opnsense: OpnSenseClient,
+        zitadel: Option<ZitadelClient>,
         metrics: Metrics,
         ingress_store: Store<IngressRoute>,
         pod_store: Store<Pod>,
@@ -52,12 +57,14 @@ impl Reconciler {
         policy_store: Store<CoreDnsPolicy>,
         reservation_store: Store<DhcpReservation>,
         dhcp_config_store: Store<DhcpConfig>,
+        oidc_store: Option<Store<OidcApplication>>,
     ) -> Self {
         Self {
             config,
             kube_client,
             cloudflare,
             opnsense,
+            zitadel,
             metrics,
             ingress_store,
             pod_store,
@@ -65,6 +72,7 @@ impl Reconciler {
             policy_store,
             reservation_store,
             dhcp_config_store,
+            oidc_store,
             current_state: Mutex::new(DnsState::new()),
             wan_ip: Mutex::new(None),
         }
@@ -327,6 +335,36 @@ impl Reconciler {
             .dhcp_reservations_total
             .set(all_reservations.len() as i64);
 
+        // -- OIDC (Zitadel apps + Traefik Middleware) --
+        if let (Some(zitadel), Some(oidc_store)) = (&self.zitadel, &self.oidc_store) {
+            let oidc_apps: Vec<_> = oidc_store.state();
+            let oidc_desired = build_oidc_desired(&oidc_apps, &ingresses);
+
+            match reconcile_oidc(
+                zitadel,
+                self.kube_client.clone(),
+                &oidc_desired,
+                self.config.dry_run,
+            )
+            .await
+            {
+                Ok(stats) => {
+                    let total = stats.created + stats.updated + stats.deleted;
+                    self.metrics
+                        .records_managed
+                        .get_or_create(&target_label("oidc"))
+                        .set(total.into());
+                }
+                Err(e) => {
+                    warn!(error = %e, "OIDC reconciliation failed");
+                    self.metrics
+                        .errors_total
+                        .get_or_create(&error_label("zitadel"))
+                        .inc();
+                }
+            }
+        }
+
         // 7. Update cached current state.
         *self.current_state.lock().expect("state mutex poisoned") = desired;
 
@@ -397,4 +435,224 @@ fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
     Err(Error::Config(
         "no running Traefik pod found with label app=traefik".to_owned(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// OIDC reconciliation
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+
+use kube::api::{Patch, PatchParams};
+use kube::Api;
+
+use crate::oidc_state::OidcAppDesired;
+use crate::ReconcileStats;
+
+/// Zitadel URL used in generated Middlewares.
+const ZITADEL_URL: &str = "https://zitadel.hr-home.xyz";
+
+/// Reconcile OIDC applications: ensure each `OidcAppDesired` has a
+/// corresponding Zitadel app and Traefik Middleware, with up-to-date
+/// redirect URIs.
+async fn reconcile_oidc(
+    zitadel: &ZitadelClient,
+    kube: Client,
+    desired: &BTreeMap<String, OidcAppDesired>,
+    dry_run: bool,
+) -> Result<ReconcileStats, Error> {
+    let mut stats = ReconcileStats::default();
+
+    for (name, app) in desired {
+        // Resolve project ID from name.
+        let project_id = match zitadel.find_project_by_name(&app.spec.project_name).await? {
+            Some(id) => id,
+            None => {
+                warn!(
+                    crd = name,
+                    project = app.spec.project_name,
+                    "Zitadel project not found, skipping OIDC app"
+                );
+                stats.skipped += 1;
+                continue;
+            }
+        };
+
+        let redirect_uris: Vec<String> = app.redirect_uris.iter().cloned().collect();
+
+        // Check if the app already exists in Zitadel.
+        let existing = zitadel.list_apps(&project_id).await?;
+        let found = existing
+            .iter()
+            .find(|a| a.name == app.spec.app_name);
+
+        match found {
+            Some(existing_app) => {
+                // App exists — check if redirect URIs need updating.
+                let current_uris: std::collections::BTreeSet<String> =
+                    existing_app.redirect_uris().iter().map(|s| s.to_string()).collect();
+                if current_uris != app.redirect_uris {
+                    if dry_run {
+                        info!(
+                            app = app.spec.app_name,
+                            added = ?(app.redirect_uris.difference(&current_uris).collect::<Vec<_>>()),
+                            "OIDC [dry-run] would update redirect URIs"
+                        );
+                    } else {
+                        zitadel
+                            .update_oidc_config(
+                                &project_id,
+                                &existing_app.id,
+                                &redirect_uris,
+                            )
+                            .await?;
+                        info!(
+                            app = app.spec.app_name,
+                            uris = redirect_uris.len(),
+                            "updated OIDC redirect URIs"
+                        );
+                    }
+                    stats.updated += 1;
+                } else {
+                    stats.skipped += 1;
+                }
+
+                // Ensure Middleware exists.
+                ensure_middleware(
+                    &kube,
+                    &app.spec,
+                    existing_app.client_id().unwrap_or_default(),
+                    &project_id,
+                    dry_run,
+                )
+                .await?;
+            }
+            None => {
+                // App doesn't exist — create it.
+                if dry_run {
+                    info!(
+                        app = app.spec.app_name,
+                        project = app.spec.project_name,
+                        "OIDC [dry-run] would create app"
+                    );
+                } else {
+                    let (app_id, client_id) = zitadel
+                        .create_oidc_app(&project_id, &app.spec.app_name, &redirect_uris)
+                        .await?;
+                    info!(
+                        app = app.spec.app_name,
+                        app_id, client_id,
+                        uris = redirect_uris.len(),
+                        "created OIDC app in Zitadel"
+                    );
+
+                    ensure_middleware(&kube, &app.spec, &client_id, &project_id, dry_run)
+                        .await?;
+                }
+                stats.created += 1;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Create or update a Traefik Middleware resource for an OIDC application.
+///
+/// Uses server-side apply so that fleet-dns owns the resource without
+/// conflicting with other controllers.
+async fn ensure_middleware(
+    kube: &Client,
+    spec: &crate::crd::OidcApplicationSpec,
+    client_id: &str,
+    project_id: &str,
+    dry_run: bool,
+) -> Result<(), Error> {
+    let mw = &spec.middleware;
+    let mw_name = &mw.name;
+    let mw_ns = &mw.namespace;
+
+    if dry_run {
+        info!(
+            middleware = %format!("{mw_ns}/{mw_name}"),
+            "OIDC [dry-run] would ensure Middleware"
+        );
+        return Ok(());
+    }
+
+    // Generate a deterministic session secret from the middleware name.
+    // This is NOT a security credential — it's used for cookie encryption
+    // by the Traefik OIDC plugin. Deterministic so restarts don't invalidate
+    // sessions.
+    let secret = format!(
+        "{:x}",
+        md5_hash(format!("fleet-dns-oidc-{mw_name}-{client_id}").as_bytes())
+    );
+
+    let scopes: Vec<serde_json::Value> = mw
+        .scopes
+        .iter()
+        .map(|s| serde_json::Value::String(s.clone()))
+        .collect();
+
+    let middleware_json = serde_json::json!({
+        "apiVersion": "traefik.io/v1alpha1",
+        "kind": "Middleware",
+        "metadata": {
+            "name": mw_name,
+            "namespace": mw_ns,
+            "labels": {
+                "fleet-dns.hr-home.xyz/managed": "true",
+                "fleet-dns.hr-home.xyz/oidc-app": spec.app_name,
+            }
+        },
+        "spec": {
+            "plugin": {
+                "oidc-auth": {
+                    "Secret": secret,
+                    "Provider": {
+                        "Url": ZITADEL_URL,
+                        "ClientId": client_id,
+                        "UsePkce": true,
+                        "ValidAudience": project_id,
+                    },
+                    "Scopes": scopes,
+                    "AuthorizationHeader": {
+                        "Name": "Authorization"
+                    }
+                }
+            }
+        }
+    });
+
+    let api: Api<kube::core::DynamicObject> = Api::namespaced_with(
+        kube.clone(),
+        mw_ns,
+        &kube::discovery::ApiResource {
+            group: "traefik.io".into(),
+            version: "v1alpha1".into(),
+            kind: "Middleware".into(),
+            api_version: "traefik.io/v1alpha1".into(),
+            plural: "middlewares".into(),
+        },
+    );
+
+    let patch_params = PatchParams::apply("fleet-dns").force();
+    api.patch(mw_name, &patch_params, &Patch::Apply(middleware_json))
+        .await?;
+
+    info!(middleware = %format!("{mw_ns}/{mw_name}"), "ensured Traefik Middleware");
+    Ok(())
+}
+
+/// Simple deterministic hash for generating session secrets.
+fn md5_hash(data: &[u8]) -> u128 {
+    // Use a simple FNV-like hash. We don't need cryptographic strength
+    // for cookie session secrets — just uniqueness and determinism.
+    let mut h: u128 = 0xcbf2_9ce4_8422_2325_14a0_2fcb_a6f1_e73b;
+    for &b in data {
+        h ^= b as u128;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }

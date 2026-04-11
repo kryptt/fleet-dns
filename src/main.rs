@@ -85,11 +85,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dry_run = config.dry_run;
 
     // 9. Build reconciler.
+    // TODO(fleet-dns-oidc): add Zitadel client and OidcApplication store
+    // when ZITADEL_URL is configured.
+    let zitadel: Option<fleet_dns::targets::zitadel::ZitadelClient> = None;
+    let oidc_store: Option<kube::runtime::reflector::Store<fleet_dns::crd::OidcApplication>> = None;
+
     let reconciler = Arc::new(Reconciler::new(
         config,
         kube_client,
         cloudflare,
         opnsense,
+        zitadel,
         metrics.clone(),
         ingress_store.clone(),
         pod_store.clone(),
@@ -97,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_store.clone(),
         reservation_store.clone(),
         dhcp_config_store.clone(),
+        oidc_store,
     ));
 
     // 10. Start HTTP server.

@@ -1,5 +1,6 @@
 pub mod dhcp;
 pub mod ingress;
+pub mod oidc;
 pub mod pods;
 pub mod policies;
 pub mod services;

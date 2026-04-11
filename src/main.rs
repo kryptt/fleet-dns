@@ -84,11 +84,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconcile_interval = config.default_reconcile_interval;
     let dry_run = config.dry_run;
 
+    // 8b. Optionally build Zitadel client + OidcApplication watcher.
+    let (zitadel, oidc_store) = match (
+        &config.zitadel_url,
+        &config.zitadel_key_id,
+        &config.zitadel_user_id,
+        &config.zitadel_private_key,
+    ) {
+        (Some(url), Some(key_id), Some(user_id), Some(private_key)) => {
+            info!("OIDC management enabled (Zitadel at {url})");
+            let client = fleet_dns::targets::zitadel::ZitadelClient::new(
+                url, key_id, user_id, private_key,
+            )?;
+            let (store, handle) =
+                discovery::oidc::start_watcher(kube_client.clone());
+            tokio::spawn(handle);
+            (Some(client), Some(store))
+        }
+        _ => {
+            info!("OIDC management disabled (ZITADEL_URL not configured)");
+            (None, None)
+        }
+    };
+
     // 9. Build reconciler.
-    // TODO(fleet-dns-oidc): add Zitadel client and OidcApplication store
-    // when ZITADEL_URL is configured.
-    let zitadel: Option<fleet_dns::targets::zitadel::ZitadelClient> = None;
-    let oidc_store: Option<kube::runtime::reflector::Store<fleet_dns::crd::OidcApplication>> = None;
 
     let reconciler = Arc::new(Reconciler::new(
         config,

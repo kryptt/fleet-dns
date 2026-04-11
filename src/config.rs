@@ -20,6 +20,12 @@ pub struct Config {
     pub wan_interface: String,
     pub cloudflare_cname_target: String,
     pub dry_run: bool,
+
+    // Optional: Zitadel OIDC management (all must be set to enable)
+    pub zitadel_url: Option<String>,
+    pub zitadel_key_id: Option<String>,
+    pub zitadel_user_id: Option<String>,
+    pub zitadel_private_key: Option<String>,
 }
 
 impl Config {
@@ -64,6 +70,12 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
+        // Zitadel OIDC (all optional — feature disabled if any are missing)
+        let zitadel_url = std::env::var("ZITADEL_URL").ok();
+        let zitadel_key_id = std::env::var("ZITADEL_KEY_ID").ok();
+        let zitadel_user_id = std::env::var("ZITADEL_USER_ID").ok();
+        let zitadel_private_key = read_secret("ZITADEL_PRIVATE_KEY").ok();
+
         Ok(Self {
             cloudflare_api_token,
             cloudflare_zone_id,
@@ -75,6 +87,10 @@ impl Config {
             wan_interface,
             cloudflare_cname_target,
             dry_run,
+            zitadel_url,
+            zitadel_key_id,
+            zitadel_user_id,
+            zitadel_private_key,
         })
     }
 }

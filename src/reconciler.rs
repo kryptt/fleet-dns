@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use k8s_openapi::api::core::v1::{Pod, Service};
-use kube::api::{Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::reflector::Store;
 use kube::{Api, Client};
 use tracing::{error, info, warn};
@@ -550,6 +550,90 @@ async fn reconcile_oidc(
         }
     }
 
+    // -- Cleanup: delete orphaned managed Middlewares --
+    //
+    // List all Middlewares with the `fleet-dns.hr-home.xyz/managed` label.
+    // Any that don't match a desired OidcApplication are orphaned: clear their
+    // Zitadel redirect URIs and delete the Middleware resource.
+    let mw_api: Api<kube::core::DynamicObject> = Api::all_with(
+        kube.clone(),
+        &middleware_api_resource(),
+    );
+    let managed_list = mw_api
+        .list(&ListParams::default().labels("fleet-dns.hr-home.xyz/managed=true"))
+        .await?;
+
+    // Build a set of desired middleware keys (namespace/name).
+    let desired_mw_keys: BTreeSet<String> = desired
+        .values()
+        .map(|app| format!("{}/{}", app.spec.middleware.namespace, app.spec.middleware.name))
+        .collect();
+
+    for mw_obj in &managed_list {
+        let mw_name = mw_obj.metadata.name.as_deref().unwrap_or_default();
+        let mw_ns = mw_obj.metadata.namespace.as_deref().unwrap_or_default();
+        let key = format!("{mw_ns}/{mw_name}");
+
+        if desired_mw_keys.contains(&key) {
+            continue;
+        }
+
+        let labels = mw_obj.metadata.labels.as_ref();
+        let app_name = labels
+            .and_then(|l| l.get("fleet-dns.hr-home.xyz/oidc-app"))
+            .map(String::as_str)
+            .unwrap_or_default();
+        let project_id = labels
+            .and_then(|l| l.get("fleet-dns.hr-home.xyz/project-id"))
+            .map(String::as_str)
+            .unwrap_or_default();
+
+        if dry_run {
+            info!(
+                middleware = %key,
+                app = app_name,
+                "OIDC [dry-run] would delete orphaned Middleware and clear redirect URIs"
+            );
+        } else {
+            // Clear redirect URIs in Zitadel (keep the app itself).
+            if !project_id.is_empty() && !app_name.is_empty() {
+                if let Ok(apps) = zitadel.list_apps(project_id).await {
+                    if let Some(found) = apps.iter().find(|a| a.name == app_name) {
+                        if !found.redirect_uris().is_empty() {
+                            if let Err(e) = zitadel
+                                .update_oidc_config(project_id, &found.id, &[])
+                                .await
+                            {
+                                warn!(
+                                    app = app_name,
+                                    error = %e,
+                                    "failed to clear Zitadel redirect URIs for orphaned app"
+                                );
+                            } else {
+                                info!(
+                                    app = app_name,
+                                    "cleared Zitadel redirect URIs for orphaned OIDC app"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Delete the orphaned Middleware.
+            let ns_api: Api<kube::core::DynamicObject> = Api::namespaced_with(
+                kube.clone(),
+                mw_ns,
+                &middleware_api_resource(),
+            );
+            ns_api
+                .delete(mw_name, &DeleteParams::default())
+                .await?;
+            info!(middleware = %key, "deleted orphaned Traefik Middleware");
+        }
+        stats.deleted += 1;
+    }
+
     Ok(stats)
 }
 
@@ -620,6 +704,7 @@ async fn ensure_middleware(
             "labels": {
                 "fleet-dns.hr-home.xyz/managed": "true",
                 "fleet-dns.hr-home.xyz/oidc-app": spec.app_name,
+                "fleet-dns.hr-home.xyz/project-id": project_id,
             }
         },
         "spec": {
@@ -632,13 +717,7 @@ async fn ensure_middleware(
     let api: Api<kube::core::DynamicObject> = Api::namespaced_with(
         kube.clone(),
         mw_ns,
-        &kube::discovery::ApiResource {
-            group: "traefik.io".into(),
-            version: "v1alpha1".into(),
-            kind: "Middleware".into(),
-            api_version: "traefik.io/v1alpha1".into(),
-            plural: "middlewares".into(),
-        },
+        &middleware_api_resource(),
     );
 
     let patch_params = PatchParams::apply("fleet-dns").force();
@@ -647,6 +726,17 @@ async fn ensure_middleware(
 
     info!(middleware = %format!("{mw_ns}/{mw_name}"), "ensured Traefik Middleware");
     Ok(())
+}
+
+/// [`ApiResource`](kube::discovery::ApiResource) for Traefik Middleware CRDs.
+fn middleware_api_resource() -> kube::discovery::ApiResource {
+    kube::discovery::ApiResource {
+        group: "traefik.io".into(),
+        version: "v1alpha1".into(),
+        kind: "Middleware".into(),
+        api_version: "traefik.io/v1alpha1".into(),
+        plural: "middlewares".into(),
+    }
 }
 
 /// Deterministic FNV-1a 128-bit hash for generating session secrets.

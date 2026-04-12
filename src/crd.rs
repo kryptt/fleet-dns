@@ -118,6 +118,7 @@ pub struct OidcApplicationSpec {
 
 /// Configuration for the Traefik OIDC Middleware that fleet-dns manages.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct OidcMiddlewareSpec {
     /// Middleware resource name.
     pub name: String,

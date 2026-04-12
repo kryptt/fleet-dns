@@ -40,10 +40,10 @@ impl ZitadelApp {
 
     /// Extract redirect URIs from the embedded OIDC config, if present.
     #[must_use]
-    pub fn redirect_uris(&self) -> Vec<&str> {
+    pub fn redirect_uris(&self) -> &[String] {
         self.oidc_config
             .as_ref()
-            .map(|c| c.redirect_uris.iter().map(String::as_str).collect())
+            .map(|c| c.redirect_uris.as_slice())
             .unwrap_or_default()
     }
 }

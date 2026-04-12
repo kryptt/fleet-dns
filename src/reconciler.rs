@@ -1,23 +1,26 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Instant;
 
 use k8s_openapi::api::core::v1::{Pod, Service};
+use kube::api::{Patch, PatchParams};
 use kube::runtime::reflector::Store;
-use kube::Client;
+use kube::{Api, Client};
 use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::crd::{CoreDnsPolicy, DhcpConfig, DhcpReservation, OidcApplication};
 use crate::error::Error;
 use crate::metrics::{error_label, target_label, Metrics};
-use crate::oidc_state::build_oidc_desired;
+use crate::oidc_state::{build_oidc_desired, OidcAppDesired};
 use crate::state::{build_desired_state, diff, merge_dhcp_reservations, DnsState};
 use crate::targets::cloudflare::CloudflareClient;
 use crate::targets::coredns;
 use crate::targets::opnsense::{validate_ip_allocation, DhcpHostEntry, OpnSenseClient};
 use crate::targets::zitadel::ZitadelClient;
 use crate::traefik::IngressRoute;
+use crate::ReconcileStats;
 
 /// The main reconciliation orchestrator.
 ///
@@ -403,10 +406,10 @@ fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
             "k8s.v1.cni.cncf.io/network-status",
             "k8s.v1.cni.cncf.io/networks",
         ] {
-            if let Some(annotation) = annotations.and_then(|a| a.get(key)) {
-                if let Some(ip) = parse_multus_ip(annotation, "lan-macvlan") {
-                    return Ok(ip);
-                }
+            if let Some(annotation) = annotations.and_then(|a| a.get(key))
+                && let Some(ip) = parse_multus_ip(annotation, "lan-macvlan")
+            {
+                return Ok(ip);
             }
         }
 
@@ -440,14 +443,6 @@ fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
 // ---------------------------------------------------------------------------
 // OIDC reconciliation
 // ---------------------------------------------------------------------------
-
-use std::collections::BTreeMap;
-
-use kube::api::{Patch, PatchParams};
-use kube::Api;
-
-use crate::oidc_state::OidcAppDesired;
-use crate::ReconcileStats;
 
 /// Zitadel URL used in generated Middlewares.
 const ZITADEL_URL: &str = "https://zitadel.hr-home.xyz";
@@ -489,8 +484,8 @@ async fn reconcile_oidc(
         match found {
             Some(existing_app) => {
                 // App exists — check if redirect URIs need updating.
-                let current_uris: std::collections::BTreeSet<String> =
-                    existing_app.redirect_uris().iter().map(|s| s.to_string()).collect();
+                let current_uris: BTreeSet<String> =
+                    existing_app.redirect_uris().iter().cloned().collect();
                 if current_uris != app.redirect_uris {
                     if dry_run {
                         info!(
@@ -517,15 +512,16 @@ async fn reconcile_oidc(
                     stats.skipped += 1;
                 }
 
-                // Ensure Middleware exists.
-                ensure_middleware(
-                    &kube,
-                    &app.spec,
-                    existing_app.client_id().unwrap_or_default(),
-                    &project_id,
-                    dry_run,
-                )
-                .await?;
+                // Ensure Middleware exists (requires a valid client_id).
+                if let Some(client_id) = existing_app.client_id() {
+                    ensure_middleware(&kube, &app.spec, client_id, &project_id, dry_run)
+                        .await?;
+                } else {
+                    warn!(
+                        app = app.spec.app_name,
+                        "Zitadel app has no OIDC config; skipping Middleware"
+                    );
+                }
             }
             None => {
                 // App doesn't exist — create it.
@@ -586,14 +582,8 @@ async fn ensure_middleware(
     // sessions.
     let secret = format!(
         "{:x}",
-        md5_hash(format!("fleet-dns-oidc-{mw_name}-{client_id}").as_bytes())
+        fnv1a_128(format!("fleet-dns-oidc-{mw_name}-{client_id}").as_bytes())
     );
-
-    let scopes: Vec<serde_json::Value> = mw
-        .scopes
-        .iter()
-        .map(|s| serde_json::Value::String(s.clone()))
-        .collect();
 
     let middleware_json = serde_json::json!({
         "apiVersion": "traefik.io/v1alpha1",
@@ -616,7 +606,7 @@ async fn ensure_middleware(
                         "UsePkce": true,
                         "ValidAudience": project_id,
                     },
-                    "Scopes": scopes,
+                    "Scopes": &mw.scopes,
                     "AuthorizationHeader": {
                         "Name": "Authorization"
                     }
@@ -645,14 +635,19 @@ async fn ensure_middleware(
     Ok(())
 }
 
-/// Simple deterministic hash for generating session secrets.
-fn md5_hash(data: &[u8]) -> u128 {
-    // Use a simple FNV-like hash. We don't need cryptographic strength
-    // for cookie session secrets — just uniqueness and determinism.
-    let mut h: u128 = 0xcbf2_9ce4_8422_2325_14a0_2fcb_a6f1_e73b;
+/// Deterministic FNV-1a 128-bit hash for generating session secrets.
+///
+/// This is NOT a cryptographic hash. It provides uniqueness and determinism
+/// for Traefik OIDC plugin cookie encryption keys, where the only requirement
+/// is that different inputs produce different outputs and the result is stable
+/// across restarts.
+fn fnv1a_128(data: &[u8]) -> u128 {
+    // FNV-1a 128-bit offset basis and prime.
+    // See: <https://www.isthe.com/chongo/tech/comp/fnv/>
+    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     for &b in data {
         h ^= b as u128;
-        h = h.wrapping_mul(0x0100_0000_01b3);
+        h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013B);
     }
     h
 }

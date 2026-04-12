@@ -22,18 +22,6 @@ pub struct OidcAppDesired {
     pub redirect_uris: BTreeSet<String>,
 }
 
-/// Changes to apply for OIDC reconciliation.
-#[derive(Debug, Default)]
-pub struct OidcChanges {
-    /// Apps to create in Zitadel (CRD exists, no Zitadel app yet).
-    pub create: Vec<OidcAppDesired>,
-    /// Apps to update (redirect URIs changed).
-    pub update: Vec<OidcAppDesired>,
-    /// Apps to delete from Zitadel (CRD deleted, Zitadel app still exists).
-    /// Tuple of (project_id, app_id, crd_name).
-    pub delete: Vec<(String, String, String)>,
-}
-
 /// Build the desired OIDC state from CRDs and labeled IngressRoutes.
 ///
 /// For each `OidcApplication`, collects all IngressRoutes with
@@ -54,7 +42,7 @@ pub fn build_oidc_desired(
             .unwrap_or_default()
             .to_owned();
 
-        let uris: BTreeSet<String> = app
+        let redirect_uris: BTreeSet<String> = app
             .spec
             .extra_redirect_uris
             .iter()
@@ -67,7 +55,7 @@ pub fn build_oidc_desired(
                 crd_name,
                 crd_namespace: crd_ns,
                 spec: app.spec.clone(),
-                redirect_uris: uris.clone(),
+                redirect_uris,
             },
         );
     }

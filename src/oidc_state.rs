@@ -143,6 +143,7 @@ mod tests {
                     name: mw_name.to_owned(),
                     namespace: "ingress".to_owned(),
                     scopes: vec!["openid".to_owned()],
+                    headers: vec![],
                 },
                 extra_redirect_uris: vec![],
             },

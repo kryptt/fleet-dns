@@ -116,6 +116,16 @@ pub struct OidcApplicationSpec {
     pub extra_redirect_uris: Vec<String>,
 }
 
+/// A header to inject into proxied requests via the Traefik OIDC plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OidcHeaderSpec {
+    /// HTTP header name (e.g. `"X-Oidc-Email"`).
+    pub name: String,
+
+    /// Value template (e.g. `"{{ .claims.email }}"`).
+    pub value: String,
+}
+
 /// Configuration for the Traefik OIDC Middleware that fleet-dns manages.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +138,10 @@ pub struct OidcMiddlewareSpec {
 
     /// OIDC scopes to request (e.g. `["openid", "profile", "email"]`).
     pub scopes: Vec<String>,
+
+    /// Optional headers forwarding OIDC claims to the upstream service.
+    #[serde(default)]
+    pub headers: Vec<OidcHeaderSpec>,
 }
 
 /// Status of an OidcApplication, updated by fleet-dns after reconciliation.
@@ -210,7 +224,10 @@ mod tests {
             "middleware": {
                 "name": "system-oidc",
                 "namespace": "ingress",
-                "scopes": ["openid", "profile", "email"]
+                "scopes": ["openid", "profile", "email"],
+                "headers": [
+                    {"name": "X-Oidc-Email", "value": "{{ .claims.email }}"}
+                ]
             },
             "extraRedirectUris": ["https://oauth.pstmn.io/v1/callback"]
         });
@@ -221,6 +238,9 @@ mod tests {
         assert_eq!(spec.middleware.namespace, "ingress");
         assert_eq!(spec.middleware.scopes, vec!["openid", "profile", "email"]);
         assert_eq!(spec.extra_redirect_uris, vec!["https://oauth.pstmn.io/v1/callback"]);
+        assert_eq!(spec.middleware.headers.len(), 1);
+        assert_eq!(spec.middleware.headers[0].name, "X-Oidc-Email");
+        assert_eq!(spec.middleware.headers[0].value, "{{ .claims.email }}");
     }
 
     #[test]
@@ -236,6 +256,7 @@ mod tests {
         });
         let spec: OidcApplicationSpec = serde_json::from_value(json).unwrap();
         assert!(spec.extra_redirect_uris.is_empty());
+        assert!(spec.middleware.headers.is_empty());
     }
 
     #[test]

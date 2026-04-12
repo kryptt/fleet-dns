@@ -585,6 +585,32 @@ async fn ensure_middleware(
         fnv1a_128(format!("fleet-dns-oidc-{mw_name}-{client_id}").as_bytes())
     );
 
+    let mut oidc_auth = serde_json::json!({
+        "Secret": secret,
+        "Provider": {
+            "Url": ZITADEL_URL,
+            "ClientId": client_id,
+            "UsePkce": true,
+            "ValidAudience": project_id,
+        },
+        "Scopes": &mw.scopes,
+        "AuthorizationHeader": {
+            "Name": "Authorization"
+        }
+    });
+
+    if !mw.headers.is_empty() {
+        oidc_auth.as_object_mut().unwrap().insert(
+            "Headers".to_owned(),
+            serde_json::json!(
+                mw.headers.iter().map(|h| serde_json::json!({
+                    "Name": &h.name,
+                    "Value": &h.value,
+                })).collect::<Vec<_>>()
+            ),
+        );
+    }
+
     let middleware_json = serde_json::json!({
         "apiVersion": "traefik.io/v1alpha1",
         "kind": "Middleware",
@@ -598,19 +624,7 @@ async fn ensure_middleware(
         },
         "spec": {
             "plugin": {
-                "oidc-auth": {
-                    "Secret": secret,
-                    "Provider": {
-                        "Url": ZITADEL_URL,
-                        "ClientId": client_id,
-                        "UsePkce": true,
-                        "ValidAudience": project_id,
-                    },
-                    "Scopes": &mw.scopes,
-                    "AuthorizationHeader": {
-                        "Name": "Authorization"
-                    }
-                }
+                "oidc-auth": oidc_auth
             }
         }
     });

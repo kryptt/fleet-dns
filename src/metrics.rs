@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicI64;
+
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -18,6 +20,7 @@ pub struct Metrics {
     pub dhcp_reservations_total: Gauge,
     pub dhcp_pool_size: Gauge,
     pub ip_conflicts_total: Counter,
+    pub process_resident_memory_bytes: Gauge<i64, AtomicI64>,
 }
 
 impl Metrics {
@@ -83,6 +86,13 @@ impl Metrics {
             ip_conflicts_total.clone(),
         );
 
+        let process_resident_memory_bytes = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "process_resident_memory_bytes",
+            "Resident memory size in bytes",
+            process_resident_memory_bytes.clone(),
+        );
+
         Self {
             reconciliations_total,
             reconcile_duration_seconds,
@@ -92,6 +102,23 @@ impl Metrics {
             dhcp_reservations_total,
             dhcp_pool_size,
             ip_conflicts_total,
+            process_resident_memory_bytes,
+        }
+    }
+
+    /// Sample RSS from `/proc/self/status` (VmRSS) and update the gauge.
+    pub fn update_process_rss(&self) {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    if let Some(kb_str) = rest.trim().strip_suffix("kB") {
+                        if let Ok(kb) = kb_str.trim().parse::<i64>() {
+                            self.process_resident_memory_bytes.set(kb * 1024);
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
 }

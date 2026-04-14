@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 10. Start HTTP server.
     let ready = Arc::new(AtomicBool::new(false));
-    let app = build_router(registry, ready.clone());
+    let app = build_router(registry, metrics.clone(), ready.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9090").await?;
     info!("HTTP server listening on :9090");
@@ -244,6 +244,7 @@ async fn verify_coredns_configmap(client: kube::Client) -> Result<(), Box<dyn st
 /// Build the axum router with health and metrics endpoints.
 fn build_router(
     registry: Arc<Registry>,
+    metrics: Metrics,
     ready: Arc<AtomicBool>,
 ) -> Router {
     Router::new()
@@ -265,12 +266,14 @@ fn build_router(
             "/metrics",
             get(move || {
                 let registry = registry.clone();
-                async move { metrics_handler(registry).await }
+                let metrics = metrics.clone();
+                async move { metrics_handler(registry, metrics).await }
             }),
         )
 }
 
-async fn metrics_handler(registry: Arc<Registry>) -> impl IntoResponse {
+async fn metrics_handler(registry: Arc<Registry>, metrics: Metrics) -> impl IntoResponse {
+    metrics.update_process_rss();
     let mut buf = String::new();
     match encode(&mut buf, &registry) {
         Ok(()) => (

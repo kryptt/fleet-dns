@@ -50,18 +50,12 @@ impl Config {
         let opnsense_api_key = read_secret("OPNSENSE_API_KEY")?;
         let opnsense_api_secret = read_secret("OPNSENSE_API_SECRET")?;
 
-        let default_reconcile_interval = optional_duration(
-            "DEFAULT_RECONCILE_INTERVAL",
-            Duration::from_secs(300),
-        )?;
+        let default_reconcile_interval =
+            optional_duration("DEFAULT_RECONCILE_INTERVAL", Duration::from_secs(300))?;
 
-        let default_dns_ttl = optional_duration(
-            "DEFAULT_DNS_TTL",
-            Duration::from_secs(300),
-        )?;
+        let default_dns_ttl = optional_duration("DEFAULT_DNS_TTL", Duration::from_secs(300))?;
 
-        let wan_interface = std::env::var("WAN_INTERFACE")
-            .unwrap_or_else(|_| "wan".to_owned());
+        let wan_interface = std::env::var("WAN_INTERFACE").unwrap_or_else(|_| "wan".to_owned());
 
         let cloudflare_cname_target = std::env::var("CLOUDFLARE_CNAME_TARGET")
             .unwrap_or_else(|_| "hr-main.hr-home.xyz".to_owned());
@@ -97,9 +91,8 @@ impl Config {
 
 /// Read a required env var, returning a config error if absent.
 fn require_env(name: &str) -> Result<String, Error> {
-    std::env::var(name).map_err(|_| {
-        Error::Config(format!("required environment variable {name} is not set"))
-    })
+    std::env::var(name)
+        .map_err(|_| Error::Config(format!("required environment variable {name} is not set")))
 }
 
 /// Read a secret value, trying `{name}_FILE` first (reading and trimming the
@@ -108,9 +101,8 @@ fn read_secret(name: &str) -> Result<String, Error> {
     let file_var = format!("{name}_FILE");
 
     if let Ok(path) = std::env::var(&file_var) {
-        let contents = std::fs::read_to_string(&path).map_err(|e| {
-            Error::Config(format!("failed to read {file_var} ({path}): {e}"))
-        })?;
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Config(format!("failed to read {file_var} ({path}): {e}")))?;
         let trimmed = contents.trim().to_owned();
         if trimmed.is_empty() {
             return Err(Error::Config(format!(
@@ -127,11 +119,8 @@ fn read_secret(name: &str) -> Result<String, Error> {
 fn optional_duration(name: &str, default: Duration) -> Result<Duration, Error> {
     match std::env::var(name) {
         Err(_) => Ok(default),
-        Ok(val) => parse_duration(&val).ok_or_else(|| {
-            Error::Config(format!(
-                "invalid duration for {name}: {val:?}"
-            ))
-        }),
+        Ok(val) => parse_duration(&val)
+            .ok_or_else(|| Error::Config(format!("invalid duration for {name}: {val:?}"))),
     }
 }
 
@@ -139,20 +128,19 @@ fn optional_duration(name: &str, default: Duration) -> Result<Duration, Error> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
 
-    /// Helper: set env vars, run a closure, then remove them.
-    ///
-    /// # Safety
-    /// Tests using this helper must run with `--test-threads=1` or otherwise
-    /// ensure no concurrent access to the process environment.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+        let _lock = ENV_LOCK.lock().unwrap();
         for (k, v) in vars {
-            // SAFETY: test-only; we serialise env-mutating tests.
+            // SAFETY: serialised by ENV_LOCK.
             unsafe { std::env::set_var(k, v) };
         }
         f();
         for (k, _) in vars {
-            // SAFETY: test-only; we serialise env-mutating tests.
+            // SAFETY: serialised by ENV_LOCK.
             unsafe { std::env::remove_var(k) };
         }
     }

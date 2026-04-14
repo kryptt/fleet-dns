@@ -1,9 +1,9 @@
 use std::future::Future;
 
 use futures::TryStreamExt;
+use kube::runtime::WatchStreamExt;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher;
-use kube::runtime::WatchStreamExt;
 use kube::{Api, Client};
 
 use crate::crd::{DhcpConfig, DhcpReservation};

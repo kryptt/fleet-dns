@@ -7,10 +7,10 @@ use kube::api::{ObjectMeta, Patch, PatchParams};
 use kube::{Api, Client};
 use tracing::{debug, info};
 
+use crate::ZONE;
 use crate::crd::CoreDnsPolicy;
 use crate::error::Error;
 use crate::state::DnsEntry;
-use crate::ZONE;
 
 /// ConfigMap key for the zone server block.
 const SERVER_KEY: &str = "hr-home-xyz.server";
@@ -208,11 +208,7 @@ mod tests {
         let search_content = "template IN A search.hr-home.xyz {\n  answer \"search.hr-home.xyz 60 IN CNAME searxng.hr-home.xyz\"\n}";
         let policies = vec![
             policy("no-aaaa.override", aaaa_content, None),
-            policy(
-                "search-fix.override",
-                search_content,
-                Some("hr-home.xyz"),
-            ),
+            policy("search-fix.override", search_content, Some("hr-home.xyz")),
         ];
 
         let data = render_configmap_data(&entries, &policies);
@@ -234,8 +230,14 @@ mod tests {
         let hosts_end = server.find("fallthrough").unwrap();
         let forward_pos = server.find("forward . /etc/resolv.conf").unwrap();
         let search_pos = server.find("template IN A search.hr-home.xyz").unwrap();
-        assert!(search_pos > hosts_end, "zone policy must come after hosts block");
-        assert!(search_pos < forward_pos, "zone policy must come before forward");
+        assert!(
+            search_pos > hosts_end,
+            "zone policy must come after hosts block"
+        );
+        assert!(
+            search_pos < forward_pos,
+            "zone policy must come before forward"
+        );
 
         // Forward and cache present.
         assert!(server.contains("forward . /etc/resolv.conf"));

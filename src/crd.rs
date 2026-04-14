@@ -237,7 +237,10 @@ mod tests {
         assert_eq!(spec.middleware.name, "system-oidc");
         assert_eq!(spec.middleware.namespace, "ingress");
         assert_eq!(spec.middleware.scopes, vec!["openid", "profile", "email"]);
-        assert_eq!(spec.extra_redirect_uris, vec!["https://oauth.pstmn.io/v1/callback"]);
+        assert_eq!(
+            spec.extra_redirect_uris,
+            vec!["https://oauth.pstmn.io/v1/callback"]
+        );
         assert_eq!(spec.middleware.headers.len(), 1);
         assert_eq!(spec.middleware.headers[0].name, "X-Oidc-Email");
         assert_eq!(spec.middleware.headers[0].value, "{{ .claims.email }}");

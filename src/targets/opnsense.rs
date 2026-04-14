@@ -69,7 +69,11 @@ fn dnsmasq_host_marker(hostname: &str) -> String {
 fn extract_dhcp_hostname(descr: &str) -> Option<&str> {
     let rest = descr.strip_prefix("[fleet-dns:dhcp:")?;
     let hostname = rest.strip_suffix(']')?;
-    if hostname.is_empty() { None } else { Some(hostname) }
+    if hostname.is_empty() {
+        None
+    } else {
+        Some(hostname)
+    }
 }
 
 /// Build the Dnsmasq DHCP range description marker.
@@ -637,12 +641,8 @@ impl OpnSenseClient {
                 description: description.to_owned(),
             },
         };
-        self.post_json_ok(
-            "/api/unbound/settings/addHostAlias",
-            &body,
-            "addHostAlias",
-        )
-        .await
+        self.post_json_ok("/api/unbound/settings/addHostAlias", &body, "addHostAlias")
+            .await
     }
 
     /// Update an existing host alias by UUID.
@@ -704,17 +704,13 @@ impl OpnSenseClient {
         // Index existing fleet-dns overrides by their marker payload (the FQDN).
         let existing_by_marker: HashMap<&str, &UnboundHostOverride> = existing_overrides
             .iter()
-            .filter_map(|o| {
-                extract_marker_payload(&o.description).map(|payload| (payload, o))
-            })
+            .filter_map(|o| extract_marker_payload(&o.description).map(|payload| (payload, o)))
             .collect();
 
         // Index existing fleet-dns aliases by their marker payload.
         let aliases_by_marker: HashMap<&str, &UnboundHostAlias> = existing_aliases
             .iter()
-            .filter_map(|a| {
-                extract_marker_payload(&a.description).map(|payload| (payload, a))
-            })
+            .filter_map(|a| extract_marker_payload(&a.description).map(|payload| (payload, a)))
             .collect();
 
         // Partition entries into A-record and alias groups.
@@ -729,8 +725,7 @@ impl OpnSenseClient {
         // Track which markers are desired (for orphan cleanup).
         let mut accounted_overrides: HashSet<String> =
             HashSet::with_capacity(a_record_entries.len());
-        let mut accounted_aliases: HashSet<String> =
-            HashSet::with_capacity(alias_entries.len());
+        let mut accounted_aliases: HashSet<String> = HashSet::with_capacity(alias_entries.len());
 
         // -- Phase 1: A records --
         for entry in &a_record_entries {
@@ -795,18 +790,14 @@ impl OpnSenseClient {
         // -- Phase 2: host aliases --
         // Find the anchor override UUID (needed as parent for all aliases).
         // Re-fetch overrides if we just created the anchor in Phase 1.
-        let anchor_uuid = if let Some(existing) =
-            existing_by_marker.get(crate::UNBOUND_ANCHOR)
-        {
+        let anchor_uuid = if let Some(existing) = existing_by_marker.get(crate::UNBOUND_ANCHOR) {
             Some(existing.uuid.clone())
         } else if !dry_run {
             // Anchor was just created — re-fetch to get its UUID.
             let refreshed = self.search_host_overrides().await?;
             refreshed
                 .iter()
-                .find(|o| {
-                    extract_marker_payload(&o.description) == Some(crate::UNBOUND_ANCHOR)
-                })
+                .find(|o| extract_marker_payload(&o.description) == Some(crate::UNBOUND_ANCHOR))
                 .map(|o| o.uuid.clone())
         } else {
             None
@@ -838,13 +829,8 @@ impl OpnSenseClient {
                                         "[dry-run] would create Unbound host alias"
                                     );
                                 } else {
-                                    self.add_host_alias(
-                                        parent_uuid,
-                                        host,
-                                        domain,
-                                        &marker,
-                                    )
-                                    .await?;
+                                    self.add_host_alias(parent_uuid, host, domain, &marker)
+                                        .await?;
                                     info!(
                                         hostname = %entry.hostname,
                                         anchor = crate::UNBOUND_ANCHOR,
@@ -1100,14 +1086,8 @@ impl OpnSenseClient {
                             "[dry-run] would create Dnsmasq DHCP host"
                         );
                     } else {
-                        self.add_dnsmasq_host(
-                            host,
-                            domain,
-                            &entry.ip,
-                            &entry.mac,
-                            &marker,
-                        )
-                        .await?;
+                        self.add_dnsmasq_host(host, domain, &entry.ip, &entry.mac, &marker)
+                            .await?;
                         info!(
                             hostname = %entry.hostname,
                             ip = %entry.ip,
@@ -1249,9 +1229,7 @@ impl OpnSenseClient {
             .map_or_else(|| "3600".to_owned(), |s| s.to_string());
 
         // Find the existing fleet-dns-managed range, if any.
-        let managed = existing
-            .iter()
-            .find(|r| r.description == marker);
+        let managed = existing.iter().find(|r| r.description == marker);
 
         // Default interface for the LAN DHCP scope.
         let interface = "lan";
@@ -1381,9 +1359,9 @@ impl OpnSenseClient {
         let parsed: UuidResponse = self
             .post_json("/api/firewall/d_nat/add_rule", &body, "add_dnat_rule")
             .await?;
-        parsed.uuid.ok_or_else(|| {
-            Error::OpnSense("add_dnat_rule response missing uuid".to_owned())
-        })
+        parsed
+            .uuid
+            .ok_or_else(|| Error::OpnSense("add_dnat_rule response missing uuid".to_owned()))
     }
 
     /// Delete a DNAT rule by UUID.
@@ -1433,9 +1411,9 @@ impl OpnSenseClient {
         let parsed: UuidResponse = self
             .post_json("/api/firewall/filter/add_rule", &body, "add_filter_rule")
             .await?;
-        parsed.uuid.ok_or_else(|| {
-            Error::OpnSense("add_filter_rule response missing uuid".to_owned())
-        })
+        parsed
+            .uuid
+            .ok_or_else(|| Error::OpnSense("add_filter_rule response missing uuid".to_owned()))
     }
 
     /// Delete a firewall filter rule by UUID.
@@ -1457,9 +1435,9 @@ impl OpnSenseClient {
                 "firewall savepoint",
             )
             .await?;
-        parsed.revision.ok_or_else(|| {
-            Error::OpnSense("savepoint response missing revision".to_owned())
-        })
+        parsed
+            .revision
+            .ok_or_else(|| Error::OpnSense("savepoint response missing revision".to_owned()))
     }
 
     /// Apply pending firewall changes.
@@ -1505,16 +1483,16 @@ impl OpnSenseClient {
                 Error::OpnSense(format!("interface {interface} not found in overview"))
             })?;
 
-        let addr_str = iface.addr4.as_deref().ok_or_else(|| {
-            Error::OpnSense(format!("interface {interface} has no IPv4 address"))
-        })?;
+        let addr_str = iface
+            .addr4
+            .as_deref()
+            .ok_or_else(|| Error::OpnSense(format!("interface {interface} has no IPv4 address")))?;
 
         // Strip CIDR prefix if present (e.g., "188.142.71.248/32" -> "188.142.71.248")
         let bare = addr_str.split('/').next().unwrap_or(addr_str);
 
-        bare.parse().map_err(|e| {
-            Error::OpnSense(format!("failed to parse WAN IP '{addr_str}': {e}"))
-        })
+        bare.parse()
+            .map_err(|e| Error::OpnSense(format!("failed to parse WAN IP '{addr_str}': {e}")))
     }
 
     /// Reconcile NAT (DNAT + filter) rules for entries with WAN-exposed ports.
@@ -1624,12 +1602,7 @@ impl OpnSenseClient {
                 } else {
                     if !dnat_exists {
                         let uuid = self
-                            .add_dnat_rule(
-                                &target_ip.to_string(),
-                                pf.port,
-                                proto_str,
-                                &marker,
-                            )
+                            .add_dnat_rule(&target_ip.to_string(), pf.port, proto_str, &marker)
                             .await?;
                         info!(
                             hostname = %entry.hostname,
@@ -1642,12 +1615,7 @@ impl OpnSenseClient {
 
                     if !filter_exists {
                         let uuid = self
-                            .add_filter_rule(
-                                &target_ip.to_string(),
-                                pf.port,
-                                proto_str,
-                                &marker,
-                            )
+                            .add_filter_rule(&target_ip.to_string(), pf.port, proto_str, &marker)
                             .await?;
                         info!(
                             hostname = %entry.hostname,
@@ -1664,9 +1632,7 @@ impl OpnSenseClient {
 
         // Delete orphaned DNAT rules.
         for rule in &existing_dnat {
-            if is_fleet_dns_managed(&rule.descr)
-                && !desired_markers.contains(&rule.descr)
-            {
+            if is_fleet_dns_managed(&rule.descr) && !desired_markers.contains(&rule.descr) {
                 if dry_run {
                     info!(
                         description = %rule.descr,
@@ -1722,12 +1688,12 @@ impl OpnSenseClient {
             let verify_dnat = self.search_dnat_rules().await?;
             let verify_filter = self.search_filter_rules().await?;
 
-            let dnat_ok = desired_markers.iter().all(|m| {
-                verify_dnat.iter().any(|r| r.descr == *m)
-            });
-            let filter_ok = desired_markers.iter().all(|m| {
-                verify_filter.iter().any(|r| r.description == *m)
-            });
+            let dnat_ok = desired_markers
+                .iter()
+                .all(|m| verify_dnat.iter().any(|r| r.descr == *m));
+            let filter_ok = desired_markers
+                .iter()
+                .all(|m| verify_filter.iter().any(|r| r.description == *m));
 
             if dnat_ok && filter_ok {
                 self.cancel_rollback(&savepoint).await?;
@@ -1878,8 +1844,7 @@ mod tests {
             "enabled": "1"
         }"#;
 
-        let parsed: UnboundHostOverride =
-            serde_json::from_str(json).expect("should deserialize");
+        let parsed: UnboundHostOverride = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(parsed.uuid, "abc-123");
         assert_eq!(parsed.hostname, "plex");
         assert_eq!(parsed.domain, "hr-home.xyz");
@@ -1914,8 +1879,7 @@ mod tests {
             ]
         }"#;
 
-        let parsed: UnboundSearchResponse =
-            serde_json::from_str(json).expect("should deserialize");
+        let parsed: UnboundSearchResponse = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(parsed.rows.len(), 1);
     }
 
@@ -1954,8 +1918,7 @@ mod tests {
             "descr": "[fleet-dns:dhcp:plex.hr-home.xyz]"
         }"#;
 
-        let parsed: DnsmasqHost =
-            serde_json::from_str(json).expect("should deserialize");
+        let parsed: DnsmasqHost = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(parsed.uuid, "dhcp-001");
         assert_eq!(parsed.host, "plex");
         assert_eq!(parsed.domain, "hr-home.xyz");
@@ -2000,8 +1963,7 @@ mod tests {
             "description": "[fleet-dns:dhcp-range]"
         }"#;
 
-        let parsed: DnsmasqRange =
-            serde_json::from_str(json).expect("should deserialize");
+        let parsed: DnsmasqRange = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(parsed.uuid, "range-001");
         assert_eq!(parsed.start_addr, "192.168.2.80");
         assert_eq!(parsed.end_addr, "192.168.2.245");
@@ -2071,12 +2033,7 @@ mod tests {
 
     #[test]
     fn validate_ip_allocation_empty_inputs() {
-        let conflicts = validate_ip_allocation(
-            &[],
-            &[],
-            "192.168.2.80",
-            "192.168.2.245",
-        );
+        let conflicts = validate_ip_allocation(&[], &[], "192.168.2.80", "192.168.2.245");
         assert!(conflicts.is_empty(), "expected no conflicts: {conflicts:?}");
     }
 }

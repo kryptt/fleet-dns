@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::crd::{OidcApplication, OidcApplicationSpec};
-use crate::traefik::{extract_hostnames, IngressRoute};
+use crate::traefik::{IngressRoute, extract_hostnames};
 
 /// Desired state for a single OIDC application.
 #[derive(Debug, Clone)]
@@ -42,12 +42,8 @@ pub fn build_oidc_desired(
             .unwrap_or_default()
             .to_owned();
 
-        let redirect_uris: BTreeSet<String> = app
-            .spec
-            .extra_redirect_uris
-            .iter()
-            .cloned()
-            .collect();
+        let redirect_uris: BTreeSet<String> =
+            app.spec.extra_redirect_uris.iter().cloned().collect();
 
         desired.insert(
             crd_name.clone(),
@@ -95,15 +91,11 @@ pub fn build_oidc_desired(
             }
 
             // Warn if the route doesn't reference the expected middleware.
-            let has_ref = route
-                .middlewares
-                .as_ref()
-                .is_some_and(|mws| {
-                    mws.iter().any(|m| {
-                        m.name == *mw_name
-                            && m.namespace.as_deref().unwrap_or_default() == mw_ns
-                    })
-                });
+            let has_ref = route.middlewares.as_ref().is_some_and(|mws| {
+                mws.iter().any(|m| {
+                    m.name == *mw_name && m.namespace.as_deref().unwrap_or_default() == mw_ns
+                })
+            });
 
             if !has_ref {
                 let ir_name = ir.metadata.name.as_deref().unwrap_or("?");
@@ -195,15 +187,33 @@ mod tests {
     fn builds_redirect_uris_from_ingress_labels() {
         let apps = vec![make_oidc_app("system-oidc", "Home", "system-oidc")];
         let ingresses = vec![
-            make_ingress("mail", "system", "mail.hr-home.xyz", Some("system-oidc"), Some(("system-oidc", "ingress"))),
-            make_ingress("network", "system", "network.hr-home.xyz", Some("system-oidc"), Some(("system-oidc", "ingress"))),
+            make_ingress(
+                "mail",
+                "system",
+                "mail.hr-home.xyz",
+                Some("system-oidc"),
+                Some(("system-oidc", "ingress")),
+            ),
+            make_ingress(
+                "network",
+                "system",
+                "network.hr-home.xyz",
+                Some("system-oidc"),
+                Some(("system-oidc", "ingress")),
+            ),
         ];
 
         let desired = build_oidc_desired(&apps, &ingresses);
         let app = desired.get("system-oidc").unwrap();
         assert_eq!(app.redirect_uris.len(), 2);
-        assert!(app.redirect_uris.contains("https://mail.hr-home.xyz/oidc/callback"));
-        assert!(app.redirect_uris.contains("https://network.hr-home.xyz/oidc/callback"));
+        assert!(
+            app.redirect_uris
+                .contains("https://mail.hr-home.xyz/oidc/callback")
+        );
+        assert!(
+            app.redirect_uris
+                .contains("https://network.hr-home.xyz/oidc/callback")
+        );
     }
 
     #[test]
@@ -214,21 +224,34 @@ mod tests {
 
         let desired = build_oidc_desired(&[app], &[]);
         let entry = desired.get("test").unwrap();
-        assert!(entry.redirect_uris.contains("https://oauth.pstmn.io/v1/callback"));
+        assert!(
+            entry
+                .redirect_uris
+                .contains("https://oauth.pstmn.io/v1/callback")
+        );
     }
 
     #[test]
     fn ignores_ingress_without_oidc_label() {
         let apps = vec![make_oidc_app("system-oidc", "Home", "system-oidc")];
         let ingresses = vec![
-            make_ingress("labeled", "system", "a.hr-home.xyz", Some("system-oidc"), Some(("system-oidc", "ingress"))),
+            make_ingress(
+                "labeled",
+                "system",
+                "a.hr-home.xyz",
+                Some("system-oidc"),
+                Some(("system-oidc", "ingress")),
+            ),
             make_ingress("unlabeled", "system", "b.hr-home.xyz", None, None),
         ];
 
         let desired = build_oidc_desired(&apps, &ingresses);
         let app = desired.get("system-oidc").unwrap();
         assert_eq!(app.redirect_uris.len(), 1);
-        assert!(app.redirect_uris.contains("https://a.hr-home.xyz/oidc/callback"));
+        assert!(
+            app.redirect_uris
+                .contains("https://a.hr-home.xyz/oidc/callback")
+        );
     }
 
     #[test]
@@ -236,8 +259,20 @@ mod tests {
         let apps = vec![make_oidc_app("test", "Home", "test-oidc")];
         // Two IngressRoutes with the same hostname
         let ingresses = vec![
-            make_ingress("ir1", "ns", "app.hr-home.xyz", Some("test"), Some(("test-oidc", "ingress"))),
-            make_ingress("ir2", "ns", "app.hr-home.xyz", Some("test"), Some(("test-oidc", "ingress"))),
+            make_ingress(
+                "ir1",
+                "ns",
+                "app.hr-home.xyz",
+                Some("test"),
+                Some(("test-oidc", "ingress")),
+            ),
+            make_ingress(
+                "ir2",
+                "ns",
+                "app.hr-home.xyz",
+                Some("test"),
+                Some(("test-oidc", "ingress")),
+            ),
         ];
 
         let desired = build_oidc_desired(&apps, &ingresses);

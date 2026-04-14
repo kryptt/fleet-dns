@@ -1,14 +1,14 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::error::Error;
 use crate::state::{CloudflareMode, DnsEntry};
-use crate::{ReconcileStats, MANAGED_ZONE, ZONE};
+use crate::{MANAGED_ZONE, ReconcileStats, ZONE};
 
 /// Minimum TTL Cloudflare accepts for non-proxied records.
 const MIN_TTL: u32 = 60;
@@ -150,10 +150,7 @@ impl CloudflareClient {
 
     /// Create a DNS record (A or CNAME).
     async fn create_record(&self, body: &CreateDnsRecord) -> Result<(), Error> {
-        let url = format!(
-            "{}/zones/{}/dns_records",
-            self.base_url, self.zone_id
-        );
+        let url = format!("{}/zones/{}/dns_records", self.base_url, self.zone_id);
 
         let resp: CloudflareResponse<DnsRecord> = self
             .client
@@ -239,9 +236,7 @@ impl CloudflareClient {
         let mut stats = ReconcileStats::default();
 
         // --- Step 1: Ensure A record for cname_target ---
-        let existing_a = a_records
-            .iter()
-            .find(|r| r.name == self.cname_target);
+        let existing_a = a_records.iter().find(|r| r.name == self.cname_target);
 
         let wan_str = wan_ip.to_string();
 
@@ -302,10 +297,8 @@ impl CloudflareClient {
         }
 
         // --- Step 2: Ensure CNAME records for managed services ---
-        let existing_by_name: std::collections::HashMap<&str, &DnsRecord> = cname_records
-            .iter()
-            .map(|r| (r.name.as_str(), r))
-            .collect();
+        let existing_by_name: std::collections::HashMap<&str, &DnsRecord> =
+            cname_records.iter().map(|r| (r.name.as_str(), r)).collect();
 
         let mut accounted: std::collections::HashSet<&str> =
             std::collections::HashSet::with_capacity(entries.len());
@@ -463,24 +456,42 @@ mod tests {
 
     #[test]
     fn compute_ttl_proxied_returns_auto() {
-        assert_eq!(compute_ttl(&CloudflareMode::Proxied, Duration::from_secs(300)), 1);
-        assert_eq!(compute_ttl(&CloudflareMode::Proxied, Duration::from_secs(0)), 1);
+        assert_eq!(
+            compute_ttl(&CloudflareMode::Proxied, Duration::from_secs(300)),
+            1
+        );
+        assert_eq!(
+            compute_ttl(&CloudflareMode::Proxied, Duration::from_secs(0)),
+            1
+        );
     }
 
     #[test]
     fn compute_ttl_dns_only_uses_configured_value() {
-        assert_eq!(compute_ttl(&CloudflareMode::DnsOnly, Duration::from_secs(300)), 300);
+        assert_eq!(
+            compute_ttl(&CloudflareMode::DnsOnly, Duration::from_secs(300)),
+            300
+        );
     }
 
     #[test]
     fn compute_ttl_dns_only_clamps_below_minimum() {
-        assert_eq!(compute_ttl(&CloudflareMode::DnsOnly, Duration::from_secs(30)), 60);
-        assert_eq!(compute_ttl(&CloudflareMode::DnsOnly, Duration::from_secs(0)), 60);
+        assert_eq!(
+            compute_ttl(&CloudflareMode::DnsOnly, Duration::from_secs(30)),
+            60
+        );
+        assert_eq!(
+            compute_ttl(&CloudflareMode::DnsOnly, Duration::from_secs(0)),
+            60
+        );
     }
 
     #[test]
     fn compute_ttl_skip_returns_zero() {
-        assert_eq!(compute_ttl(&CloudflareMode::Skip, Duration::from_secs(300)), 0);
+        assert_eq!(
+            compute_ttl(&CloudflareMode::Skip, Duration::from_secs(300)),
+            0
+        );
     }
 
     #[test]
@@ -509,17 +520,26 @@ mod tests {
     #[test]
     fn format_errors_produces_readable_string() {
         let errors = vec![
-            CloudflareError { code: 1003, message: "Invalid zone".to_owned() },
-            CloudflareError { code: 9999, message: "Unknown".to_owned() },
+            CloudflareError {
+                code: 1003,
+                message: "Invalid zone".to_owned(),
+            },
+            CloudflareError {
+                code: 9999,
+                message: "Unknown".to_owned(),
+            },
         ];
-        assert_eq!(format_errors(&errors), "[1003] Invalid zone; [9999] Unknown");
+        assert_eq!(
+            format_errors(&errors),
+            "[1003] Invalid zone; [9999] Unknown"
+        );
     }
 
     #[test]
     fn skip_and_unmanaged_entries_are_filtered() {
         use crate::state::WanExpose;
 
-        let entries = vec![
+        let entries = [
             DnsEntry {
                 hostname: "managed.hr-home.xyz".to_owned(),
                 lan_ip: "10.0.0.1".parse().unwrap(),

@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::crd::DhcpReservation;
 use crate::discovery::parse_multus_ip;
-use crate::traefik::{extract_hostnames, IngressRoute};
+use crate::traefik::{IngressRoute, extract_hostnames};
 use crate::{MANAGED_ZONE, UNBOUND_ANCHOR, ZONE};
 
 /// The Multus network attachment name used for LAN macvlan interfaces.
@@ -156,20 +156,20 @@ fn find_backing_service<'a>(
         route.services.as_ref()?.iter().find_map(|svc_ref| {
             let svc_ns = svc_ref.namespace.as_deref().unwrap_or(ir_ns);
             let svc_name = &svc_ref.name;
-            service_store.iter().find(|s| {
-                let meta = &s.metadata;
-                meta.namespace.as_deref().unwrap_or("default") == svc_ns
-                    && meta.name.as_deref() == Some(svc_name.as_str())
-            }).map(|s| s.as_ref())
+            service_store
+                .iter()
+                .find(|s| {
+                    let meta = &s.metadata;
+                    meta.namespace.as_deref().unwrap_or("default") == svc_ns
+                        && meta.name.as_deref() == Some(svc_name.as_str())
+                })
+                .map(|s| s.as_ref())
         })
     })
 }
 
 /// Find Pods matching a Service's selector in the given namespace.
-fn find_matching_pods<'a>(
-    svc: &Service,
-    pod_store: &'a [Arc<Pod>],
-) -> Vec<&'a Pod> {
+fn find_matching_pods<'a>(svc: &Service, pod_store: &'a [Arc<Pod>]) -> Vec<&'a Pod> {
     let svc_ns = svc.metadata.namespace.as_deref().unwrap_or("default");
 
     let selector = match svc.spec.as_ref().and_then(|s| s.selector.as_ref()) {
@@ -318,7 +318,7 @@ pub fn build_desired_state(
                         let ports = match get_label(&labels, "wan-ports") {
                             Some(p) => parse_wan_ports(p),
                             None => backing_svc
-                                .map(|s| infer_ports_from_service(s))
+                                .map(infer_ports_from_service)
                                 .unwrap_or_default(),
                         };
                         if ports.is_empty() {
@@ -339,18 +339,21 @@ pub fn build_desired_state(
             _ => WanExpose::Skip,
         };
 
-        state.insert(hostname.clone(), DnsEntry {
-            hostname,
-            lan_ip: traefik_ip,
-            macvlan_ip,
-            cloudflare_mode,
-            wan_expose,
-            dns_ttl,
-            reconcile_interval,
-            managed,
-            source,
-            unbound_alias_target: None,
-        });
+        state.insert(
+            hostname.clone(),
+            DnsEntry {
+                hostname,
+                lan_ip: traefik_ip,
+                macvlan_ip,
+                cloudflare_mode,
+                wan_expose,
+                dns_ttl,
+                reconcile_interval,
+                managed,
+                source,
+                unbound_alias_target: None,
+            },
+        );
     }
 
     // Post-process: make all IngressRoute entries into Unbound aliases
@@ -364,18 +367,21 @@ pub fn build_desired_state(
 
     // Ensure the anchor entry exists as an A record.
     if !state.contains_key(&anchor) {
-        state.insert(anchor.clone(), DnsEntry {
-            hostname: anchor.clone(),
-            lan_ip: traefik_ip,
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Skip,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: true,
-            source: "synthetic/unbound-anchor".to_owned(),
-            unbound_alias_target: None,
-        });
+        state.insert(
+            anchor.clone(),
+            DnsEntry {
+                hostname: anchor.clone(),
+                lan_ip: traefik_ip,
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Skip,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: true,
+                source: "synthetic/unbound-anchor".to_owned(),
+                unbound_alias_target: None,
+            },
+        );
     }
 
     // Collect direct entries to add (can't mutate state while iterating).
@@ -398,7 +404,10 @@ pub fn build_desired_state(
         if let Some(mvip) = entry.macvlan_ip.filter(|&ip| ip != entry.lan_ip) {
             let direct_host = format!(
                 "{}-direct.{ZONE}",
-                entry.hostname.strip_suffix(&format!(".{ZONE}")).unwrap_or(&entry.hostname)
+                entry
+                    .hostname
+                    .strip_suffix(&format!(".{ZONE}"))
+                    .unwrap_or(&entry.hostname)
             );
             direct_entries.push(DnsEntry {
                 hostname: direct_host,
@@ -502,18 +511,21 @@ pub fn merge_dhcp_reservations(
             }
         };
 
-        state.insert(hostname.clone(), DnsEntry {
-            hostname: hostname.clone(),
-            lan_ip,
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Skip,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: true,
-            source: format!("dhcp/{}", reservation.spec.hostname),
-            unbound_alias_target: None,
-        });
+        state.insert(
+            hostname.clone(),
+            DnsEntry {
+                hostname: hostname.clone(),
+                lan_ip,
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Skip,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: true,
+                source: format!("dhcp/{}", reservation.spec.hostname),
+                unbound_alias_target: None,
+            },
+        );
 
         result.push(Arc::clone(reservation));
     }
@@ -528,9 +540,7 @@ pub fn merge_dhcp_reservations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::{
-        PodSpec, PodStatus, ServicePort, ServiceSpec,
-    };
+    use k8s_openapi::api::core::v1::{PodSpec, PodStatus, ServicePort, ServiceSpec};
     use kube::api::ObjectMeta;
 
     // ---- Test fixture builders ----
@@ -669,12 +679,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.51/24"]}]"#),
         );
 
-        let state = build_desired_state(
-            &[ir],
-            &[pod],
-            &[svc],
-            traefik_ip(),
-        );
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
 
         // Main entry becomes an alias to the anchor.
         let entry = state.get("hass.hr-home.xyz").expect("entry must exist");
@@ -687,7 +692,9 @@ mod tests {
         );
 
         // Direct entry is emitted for the macvlan IP.
-        let direct = state.get("hass-direct.hr-home.xyz").expect("direct entry must exist");
+        let direct = state
+            .get("hass-direct.hr-home.xyz")
+            .expect("direct entry must exist");
         assert_eq!(direct.lan_ip, "192.168.2.51".parse::<IpAddr>().unwrap());
         assert_eq!(direct.macvlan_ip, None);
         assert!(direct.managed);
@@ -715,12 +722,7 @@ mod tests {
             labels(&[("app", "plex")]),
             vec![(32400, "TCP")],
         );
-        let pod = make_pod(
-            "media",
-            "plex-pod",
-            labels(&[("app", "plex")]),
-            None,
-        );
+        let pod = make_pod("media", "plex-pod", labels(&[("app", "plex")]), None);
 
         let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
 
@@ -732,7 +734,7 @@ mod tests {
             Some(crate::UNBOUND_ANCHOR.to_owned())
         );
         // No -direct entry since no macvlan IP.
-        assert!(state.get("plex-direct.hr-home.xyz").is_none());
+        assert!(!state.contains_key("plex-direct.hr-home.xyz"));
     }
 
     #[test]
@@ -796,7 +798,10 @@ mod tests {
             "plex",
             "Host(`plex.hr-home.xyz`)",
             "plex-svc",
-            labels(&[("hr-home.xyz/dns", "true"), ("hr-home.xyz/wan-expose", "true")]),
+            labels(&[
+                ("hr-home.xyz/dns", "true"),
+                ("hr-home.xyz/wan-expose", "true"),
+            ]),
         );
         let svc = make_service(
             "media",
@@ -894,84 +899,102 @@ mod tests {
     #[test]
     fn diff_detects_add_update_remove() {
         let mut current = DnsState::new();
-        current.insert("old.hr-home.xyz".to_owned(), DnsEntry {
-            hostname: "old.hr-home.xyz".to_owned(),
-            lan_ip: traefik_ip(),
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Proxied,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: true,
-            source: "system/old".to_owned(),
-            unbound_alias_target: None,
-        });
-        current.insert("same.hr-home.xyz".to_owned(), DnsEntry {
-            hostname: "same.hr-home.xyz".to_owned(),
-            lan_ip: traefik_ip(),
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Proxied,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: true,
-            source: "system/same".to_owned(),
-            unbound_alias_target: None,
-        });
-        current.insert("changed.hr-home.xyz".to_owned(), DnsEntry {
-            hostname: "changed.hr-home.xyz".to_owned(),
-            lan_ip: traefik_ip(),
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Proxied,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: false, // was false
-            source: "system/changed".to_owned(),
-            unbound_alias_target: None,
-        });
+        current.insert(
+            "old.hr-home.xyz".to_owned(),
+            DnsEntry {
+                hostname: "old.hr-home.xyz".to_owned(),
+                lan_ip: traefik_ip(),
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Proxied,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: true,
+                source: "system/old".to_owned(),
+                unbound_alias_target: None,
+            },
+        );
+        current.insert(
+            "same.hr-home.xyz".to_owned(),
+            DnsEntry {
+                hostname: "same.hr-home.xyz".to_owned(),
+                lan_ip: traefik_ip(),
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Proxied,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: true,
+                source: "system/same".to_owned(),
+                unbound_alias_target: None,
+            },
+        );
+        current.insert(
+            "changed.hr-home.xyz".to_owned(),
+            DnsEntry {
+                hostname: "changed.hr-home.xyz".to_owned(),
+                lan_ip: traefik_ip(),
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Proxied,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: false, // was false
+                source: "system/changed".to_owned(),
+                unbound_alias_target: None,
+            },
+        );
 
         let mut desired = DnsState::new();
         // "old" is gone -> remove
         // "same" is identical -> no change
-        desired.insert("same.hr-home.xyz".to_owned(), DnsEntry {
-            hostname: "same.hr-home.xyz".to_owned(),
-            lan_ip: traefik_ip(),
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Proxied,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: true,
-            source: "system/same".to_owned(),
-            unbound_alias_target: None,
-        });
+        desired.insert(
+            "same.hr-home.xyz".to_owned(),
+            DnsEntry {
+                hostname: "same.hr-home.xyz".to_owned(),
+                lan_ip: traefik_ip(),
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Proxied,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: true,
+                source: "system/same".to_owned(),
+                unbound_alias_target: None,
+            },
+        );
         // "changed" has managed flipped -> update
-        desired.insert("changed.hr-home.xyz".to_owned(), DnsEntry {
-            hostname: "changed.hr-home.xyz".to_owned(),
-            lan_ip: traefik_ip(),
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Proxied,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: true, // changed to true
-            source: "system/changed".to_owned(),
-            unbound_alias_target: None,
-        });
+        desired.insert(
+            "changed.hr-home.xyz".to_owned(),
+            DnsEntry {
+                hostname: "changed.hr-home.xyz".to_owned(),
+                lan_ip: traefik_ip(),
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Proxied,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: true, // changed to true
+                source: "system/changed".to_owned(),
+                unbound_alias_target: None,
+            },
+        );
         // "new" is added
-        desired.insert("new.hr-home.xyz".to_owned(), DnsEntry {
-            hostname: "new.hr-home.xyz".to_owned(),
-            lan_ip: traefik_ip(),
-            macvlan_ip: None,
-            cloudflare_mode: CloudflareMode::Proxied,
-            wan_expose: WanExpose::Skip,
-            dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
-            managed: true,
-            source: "system/new".to_owned(),
-            unbound_alias_target: None,
-        });
+        desired.insert(
+            "new.hr-home.xyz".to_owned(),
+            DnsEntry {
+                hostname: "new.hr-home.xyz".to_owned(),
+                lan_ip: traefik_ip(),
+                macvlan_ip: None,
+                cloudflare_mode: CloudflareMode::Proxied,
+                wan_expose: WanExpose::Skip,
+                dns_ttl: Duration::from_secs(300),
+                reconcile_interval: Duration::from_secs(300),
+                managed: true,
+                source: "system/new".to_owned(),
+                unbound_alias_target: None,
+            },
+        );
 
         let changes = diff(&desired, &current);
 
@@ -1080,8 +1103,20 @@ mod tests {
     fn parse_wan_ports_valid() {
         let ports = parse_wan_ports("32400/tcp,32469/tcp");
         assert_eq!(ports.len(), 2);
-        assert_eq!(ports[0], PortForward { port: 32400, protocol: Protocol::Tcp });
-        assert_eq!(ports[1], PortForward { port: 32469, protocol: Protocol::Tcp });
+        assert_eq!(
+            ports[0],
+            PortForward {
+                port: 32400,
+                protocol: Protocol::Tcp
+            }
+        );
+        assert_eq!(
+            ports[1],
+            PortForward {
+                port: 32469,
+                protocol: Protocol::Tcp
+            }
+        );
     }
 
     #[test]
@@ -1170,7 +1205,7 @@ mod tests {
         assert!(anchor.managed);
 
         // No -direct entry for the anchor itself.
-        assert!(state.get("ha-direct.hr-home.xyz").is_none());
+        assert!(!state.contains_key("ha-direct.hr-home.xyz"));
     }
 
     #[test]
@@ -1254,7 +1289,7 @@ mod tests {
         let mut state = build_desired_state(&[ir], &[], &[], traefik_ip());
 
         let reservation = make_dhcp_reservation("hass", "aa:bb:cc:dd:ee:ff", "192.168.2.50");
-        let returned = merge_dhcp_reservations(&mut state, &[reservation.clone()]);
+        let returned = merge_dhcp_reservations(&mut state, std::slice::from_ref(&reservation));
 
         // Conflicting reservation must still appear in the returned Vec for Dnsmasq.
         assert_eq!(returned.len(), 1);

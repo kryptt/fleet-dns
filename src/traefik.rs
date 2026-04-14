@@ -87,15 +87,13 @@ mod tests {
 
     #[test]
     fn multiple_or() {
-        let hosts =
-            extract_hostnames("Host(`a.hr-home.xyz`) || Host(`b.hr-home.xyz`)");
+        let hosts = extract_hostnames("Host(`a.hr-home.xyz`) || Host(`b.hr-home.xyz`)");
         assert_eq!(hosts, vec!["a.hr-home.xyz", "b.hr-home.xyz"]);
     }
 
     #[test]
     fn combined_with_path() {
-        let hosts =
-            extract_hostnames("Host(`foo.hr-home.xyz`) && PathPrefix(`/api`)");
+        let hosts = extract_hostnames("Host(`foo.hr-home.xyz`) && PathPrefix(`/api`)");
         assert_eq!(hosts, vec!["foo.hr-home.xyz"]);
     }
 

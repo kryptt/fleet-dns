@@ -231,14 +231,8 @@ impl ZitadelClient {
             .client
             .post(format!("{}/oauth/v2/token", self.base_url))
             .form(&[
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                ),
-                (
-                    "scope",
-                    "openid urn:zitadel:iam:org:project:id:zitadel:aud",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("scope", "openid urn:zitadel:iam:org:project:id:zitadel:aud"),
                 ("assertion", &assertion),
             ])
             .send()
@@ -254,11 +248,13 @@ impl ZitadelClient {
 
         let token_resp: TokenResponse = resp.json().await?;
 
-        let expires_at = Instant::now()
-            + Duration::from_secs(token_resp.expires_in)
-            - TOKEN_REFRESH_BUFFER;
+        let expires_at =
+            Instant::now() + Duration::from_secs(token_resp.expires_in) - TOKEN_REFRESH_BUFFER;
 
-        info!(expires_in_secs = token_resp.expires_in, "acquired Zitadel access token");
+        info!(
+            expires_in_secs = token_resp.expires_in,
+            "acquired Zitadel access token"
+        );
 
         Ok(CachedToken {
             access_token: token_resp.access_token,
@@ -368,11 +364,7 @@ impl ZitadelClient {
             .post_json(&path, &serde_json::json!({}), "list_apps")
             .await?;
 
-        info!(
-            project_id,
-            count = resp.result.len(),
-            "listed Zitadel apps"
-        );
+        info!(project_id, count = resp.result.len(), "listed Zitadel apps");
         Ok(resp.result)
     }
 
@@ -401,8 +393,7 @@ impl ZitadelClient {
             id_token_userinfo_assertion: true,
         };
 
-        let resp: CreateOidcAppResponse =
-            self.post_json(&path, &body, "create_oidc_app").await?;
+        let resp: CreateOidcAppResponse = self.post_json(&path, &body, "create_oidc_app").await?;
 
         info!(
             project_id,
@@ -422,9 +413,7 @@ impl ZitadelClient {
         app_id: &str,
         redirect_uris: &[String],
     ) -> Result<(), Error> {
-        let path = format!(
-            "/management/v1/projects/{project_id}/apps/{app_id}/oidc_config"
-        );
+        let path = format!("/management/v1/projects/{project_id}/apps/{app_id}/oidc_config");
 
         let body = UpdateOidcConfigRequest {
             redirect_uris: redirect_uris.to_vec(),

@@ -35,9 +35,8 @@ impl Metrics {
             reconciliations_total.clone(),
         );
 
-        let reconcile_duration_seconds = Histogram::new(
-            [0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0].into_iter(),
-        );
+        let reconcile_duration_seconds =
+            Histogram::new([0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]);
         sub.register(
             "reconcile_duration_seconds",
             "Duration of each reconciliation pass in seconds",
@@ -111,10 +110,10 @@ impl Metrics {
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
                 if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    if let Some(kb_str) = rest.trim().strip_suffix("kB") {
-                        if let Ok(kb) = kb_str.trim().parse::<i64>() {
-                            self.process_resident_memory_bytes.set(kb * 1024);
-                        }
+                    if let Some(kb_str) = rest.trim().strip_suffix("kB")
+                        && let Ok(kb) = kb_str.trim().parse::<i64>()
+                    {
+                        self.process_resident_memory_bytes.set(kb * 1024);
                     }
                     break;
                 }

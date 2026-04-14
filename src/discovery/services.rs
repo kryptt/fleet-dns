@@ -2,9 +2,9 @@ use std::future::Future;
 
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Service;
+use kube::runtime::WatchStreamExt;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher;
-use kube::runtime::WatchStreamExt;
 use kube::{Api, Client};
 
 /// Start a reflector that watches all `Service` resources cluster-wide.

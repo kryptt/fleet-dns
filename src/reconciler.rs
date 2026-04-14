@@ -9,18 +9,18 @@ use kube::runtime::reflector::Store;
 use kube::{Api, Client};
 use tracing::{error, info, warn};
 
+use crate::ReconcileStats;
 use crate::config::Config;
 use crate::crd::{CoreDnsPolicy, DhcpConfig, DhcpReservation, OidcApplication};
 use crate::error::Error;
-use crate::metrics::{error_label, target_label, Metrics};
-use crate::oidc_state::{build_oidc_desired, OidcAppDesired};
-use crate::state::{build_desired_state, diff, merge_dhcp_reservations, DnsState};
+use crate::metrics::{Metrics, error_label, target_label};
+use crate::oidc_state::{OidcAppDesired, build_oidc_desired};
+use crate::state::{DnsState, build_desired_state, diff, merge_dhcp_reservations};
 use crate::targets::cloudflare::CloudflareClient;
 use crate::targets::coredns;
-use crate::targets::opnsense::{validate_ip_allocation, DhcpHostEntry, OpnSenseClient};
+use crate::targets::opnsense::{DhcpHostEntry, OpnSenseClient, validate_ip_allocation};
 use crate::targets::zitadel::ZitadelClient;
 use crate::traefik::IngressRoute;
-use crate::ReconcileStats;
 
 /// The main reconciliation orchestrator.
 ///
@@ -129,10 +129,7 @@ impl Reconciler {
         let dhcp_configs: Vec<_> = self.dhcp_config_store.state();
 
         // 4. Get current WAN IP from OPNsense.
-        let wan_ip = self
-            .opnsense
-            .get_wan_ip(&self.config.wan_interface)
-            .await?;
+        let wan_ip = self.opnsense.get_wan_ip(&self.config.wan_interface).await?;
 
         // Detect WAN IP changes.
         {
@@ -145,12 +142,15 @@ impl Reconciler {
         }
 
         // 5. Diff against cached current state.
-        let current = self.current_state.lock().expect("state mutex poisoned").clone();
+        let current = self
+            .current_state
+            .lock()
+            .expect("state mutex poisoned")
+            .clone();
         let changes = diff(&desired, &current);
 
-        let has_changes = !changes.add.is_empty()
-            || !changes.update.is_empty()
-            || !changes.remove.is_empty();
+        let has_changes =
+            !changes.add.is_empty() || !changes.update.is_empty() || !changes.remove.is_empty();
 
         if !has_changes {
             return Ok(());
@@ -217,9 +217,12 @@ impl Reconciler {
 
         // -- CoreDNS (internal, ALL entries unconditionally) --
         let configmap_data = coredns::render_configmap_data(&all_entries, &policies);
-        if let Err(e) =
-            coredns::apply_configmap(self.kube_client.clone(), configmap_data, self.config.dry_run)
-                .await
+        if let Err(e) = coredns::apply_configmap(
+            self.kube_client.clone(),
+            configmap_data,
+            self.config.dry_run,
+        )
+        .await
         {
             warn!(error = %e, "CoreDNS reconciliation failed");
             self.metrics
@@ -302,7 +305,9 @@ impl Reconciler {
                 for conflict in &conflicts {
                     error!(conflict = %conflict, "IP allocation conflict detected");
                 }
-                self.metrics.ip_conflicts_total.inc_by(conflicts.len() as u64);
+                self.metrics
+                    .ip_conflicts_total
+                    .inc_by(conflicts.len() as u64);
             } else {
                 match self
                     .opnsense
@@ -420,9 +425,7 @@ fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
             .and_then(|s| s.pod_ips.as_ref())
             .and_then(|ips| ips.first())
             .map(|pip| pip.ip.as_str())
-            .or_else(|| {
-                pod.status.as_ref().and_then(|s| s.pod_ip.as_deref())
-            });
+            .or_else(|| pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()));
 
         if let Some(ip) = ip_str {
             match ip.parse::<IpAddr>() {
@@ -477,9 +480,7 @@ async fn reconcile_oidc(
 
         // Check if the app already exists in Zitadel.
         let existing = zitadel.list_apps(&project_id).await?;
-        let found = existing
-            .iter()
-            .find(|a| a.name == app.spec.app_name);
+        let found = existing.iter().find(|a| a.name == app.spec.app_name);
 
         match found {
             Some(existing_app) => {
@@ -495,11 +496,7 @@ async fn reconcile_oidc(
                         );
                     } else {
                         zitadel
-                            .update_oidc_config(
-                                &project_id,
-                                &existing_app.id,
-                                &redirect_uris,
-                            )
+                            .update_oidc_config(&project_id, &existing_app.id, &redirect_uris)
                             .await?;
                         info!(
                             app = app.spec.app_name,
@@ -514,8 +511,7 @@ async fn reconcile_oidc(
 
                 // Ensure Middleware exists (requires a valid client_id).
                 if let Some(client_id) = existing_app.client_id() {
-                    ensure_middleware(&kube, &app.spec, client_id, &project_id, dry_run)
-                        .await?;
+                    ensure_middleware(&kube, &app.spec, client_id, &project_id, dry_run).await?;
                 } else {
                     warn!(
                         app = app.spec.app_name,
@@ -537,13 +533,13 @@ async fn reconcile_oidc(
                         .await?;
                     info!(
                         app = app.spec.app_name,
-                        app_id, client_id,
+                        app_id,
+                        client_id,
                         uris = redirect_uris.len(),
                         "created OIDC app in Zitadel"
                     );
 
-                    ensure_middleware(&kube, &app.spec, &client_id, &project_id, dry_run)
-                        .await?;
+                    ensure_middleware(&kube, &app.spec, &client_id, &project_id, dry_run).await?;
                 }
                 stats.created += 1;
             }
@@ -555,10 +551,8 @@ async fn reconcile_oidc(
     // List all Middlewares with the `fleet-dns.hr-home.xyz/managed` label.
     // Any that don't match a desired OidcApplication are orphaned: clear their
     // Zitadel redirect URIs and delete the Middleware resource.
-    let mw_api: Api<kube::core::DynamicObject> = Api::all_with(
-        kube.clone(),
-        &middleware_api_resource(),
-    );
+    let mw_api: Api<kube::core::DynamicObject> =
+        Api::all_with(kube.clone(), &middleware_api_resource());
     let managed_list = mw_api
         .list(&ListParams::default().labels("fleet-dns.hr-home.xyz/managed=true"))
         .await?;
@@ -566,7 +560,12 @@ async fn reconcile_oidc(
     // Build a set of desired middleware keys (namespace/name).
     let desired_mw_keys: BTreeSet<String> = desired
         .values()
-        .map(|app| format!("{}/{}", app.spec.middleware.namespace, app.spec.middleware.name))
+        .map(|app| {
+            format!(
+                "{}/{}",
+                app.spec.middleware.namespace, app.spec.middleware.name
+            )
+        })
         .collect();
 
     for mw_obj in &managed_list {
@@ -596,39 +595,30 @@ async fn reconcile_oidc(
             );
         } else {
             // Clear redirect URIs in Zitadel (keep the app itself).
-            if !project_id.is_empty() && !app_name.is_empty() {
-                if let Ok(apps) = zitadel.list_apps(project_id).await {
-                    if let Some(found) = apps.iter().find(|a| a.name == app_name) {
-                        if !found.redirect_uris().is_empty() {
-                            if let Err(e) = zitadel
-                                .update_oidc_config(project_id, &found.id, &[])
-                                .await
-                            {
-                                warn!(
-                                    app = app_name,
-                                    error = %e,
-                                    "failed to clear Zitadel redirect URIs for orphaned app"
-                                );
-                            } else {
-                                info!(
-                                    app = app_name,
-                                    "cleared Zitadel redirect URIs for orphaned OIDC app"
-                                );
-                            }
-                        }
-                    }
+            if !project_id.is_empty()
+                && !app_name.is_empty()
+                && let Ok(apps) = zitadel.list_apps(project_id).await
+                && let Some(found) = apps.iter().find(|a| a.name == app_name)
+                && !found.redirect_uris().is_empty()
+            {
+                if let Err(e) = zitadel.update_oidc_config(project_id, &found.id, &[]).await {
+                    warn!(
+                        app = app_name,
+                        error = %e,
+                        "failed to clear Zitadel redirect URIs for orphaned app"
+                    );
+                } else {
+                    info!(
+                        app = app_name,
+                        "cleared Zitadel redirect URIs for orphaned OIDC app"
+                    );
                 }
             }
 
             // Delete the orphaned Middleware.
-            let ns_api: Api<kube::core::DynamicObject> = Api::namespaced_with(
-                kube.clone(),
-                mw_ns,
-                &middleware_api_resource(),
-            );
-            ns_api
-                .delete(mw_name, &DeleteParams::default())
-                .await?;
+            let ns_api: Api<kube::core::DynamicObject> =
+                Api::namespaced_with(kube.clone(), mw_ns, &middleware_api_resource());
+            ns_api.delete(mw_name, &DeleteParams::default()).await?;
             info!(middleware = %key, "deleted orphaned Traefik Middleware");
         }
         stats.deleted += 1;
@@ -687,10 +677,13 @@ async fn ensure_middleware(
         oidc_auth.as_object_mut().unwrap().insert(
             "Headers".to_owned(),
             serde_json::json!(
-                mw.headers.iter().map(|h| serde_json::json!({
-                    "Name": &h.name,
-                    "Value": &h.value,
-                })).collect::<Vec<_>>()
+                mw.headers
+                    .iter()
+                    .map(|h| serde_json::json!({
+                        "Name": &h.name,
+                        "Value": &h.value,
+                    }))
+                    .collect::<Vec<_>>()
             ),
         );
     }
@@ -714,11 +707,8 @@ async fn ensure_middleware(
         }
     });
 
-    let api: Api<kube::core::DynamicObject> = Api::namespaced_with(
-        kube.clone(),
-        mw_ns,
-        &middleware_api_resource(),
-    );
+    let api: Api<kube::core::DynamicObject> =
+        Api::namespaced_with(kube.clone(), mw_ns, &middleware_api_resource());
 
     let patch_params = PatchParams::apply("fleet-dns").force();
     api.patch(mw_name, &patch_params, &Patch::Apply(middleware_json))

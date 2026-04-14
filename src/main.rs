@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
 use tokio::sync::Notify;
@@ -49,14 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(registry);
 
     // 7. Start watchers.
-    let (ingress_store, ingress_handle) =
-        discovery::ingress::start_watcher(kube_client.clone());
-    let (pod_store, pod_handle) =
-        discovery::pods::start_watcher(kube_client.clone());
-    let (service_store, service_handle) =
-        discovery::services::start_watcher(kube_client.clone());
-    let (policy_store, policy_handle) =
-        discovery::policies::start_watcher(kube_client.clone());
+    let (ingress_store, ingress_handle) = discovery::ingress::start_watcher(kube_client.clone());
+    let (pod_store, pod_handle) = discovery::pods::start_watcher(kube_client.clone());
+    let (service_store, service_handle) = discovery::services::start_watcher(kube_client.clone());
+    let (policy_store, policy_handle) = discovery::policies::start_watcher(kube_client.clone());
     let (reservation_store, reservation_handle) =
         discovery::dhcp::start_reservation_watcher(kube_client.clone());
     let (dhcp_config_store, dhcp_config_handle) =
@@ -93,11 +89,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         (Some(url), Some(key_id), Some(user_id), Some(private_key)) => {
             info!("OIDC management enabled (Zitadel at {url})");
-            let client = fleet_dns::targets::zitadel::ZitadelClient::new(
-                url, key_id, user_id, private_key,
-            )?;
-            let (store, handle) =
-                discovery::oidc::start_watcher(kube_client.clone());
+            let client =
+                fleet_dns::targets::zitadel::ZitadelClient::new(url, key_id, user_id, private_key)?;
+            let (store, handle) = discovery::oidc::start_watcher(kube_client.clone());
             tokio::spawn(handle);
             (Some(client), Some(store))
         }
@@ -242,11 +236,7 @@ async fn verify_coredns_configmap(client: kube::Client) -> Result<(), Box<dyn st
 }
 
 /// Build the axum router with health and metrics endpoints.
-fn build_router(
-    registry: Arc<Registry>,
-    metrics: Metrics,
-    ready: Arc<AtomicBool>,
-) -> Router {
+fn build_router(registry: Arc<Registry>, metrics: Metrics, ready: Arc<AtomicBool>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route(
@@ -312,7 +302,10 @@ async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
         .filter(|o| fleet_dns::targets::opnsense::is_fleet_dns_managed(&o.description))
         .collect();
 
-    info!(count = managed_overrides.len(), "found fleet-dns Unbound overrides");
+    info!(
+        count = managed_overrides.len(),
+        "found fleet-dns Unbound overrides"
+    );
     for o in &managed_overrides {
         if config.dry_run {
             info!(uuid = %o.uuid, desc = %o.description, "[dry-run] would delete Unbound override");
@@ -367,7 +360,9 @@ async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
 
     // Clean up Cloudflare: reconcile with empty desired state removes all managed records.
     info!("cleaning up Cloudflare records");
-    cloudflare.reconcile(&[], "0.0.0.0".parse().unwrap(), config.dry_run).await?;
+    cloudflare
+        .reconcile(&[], "0.0.0.0".parse().unwrap(), config.dry_run)
+        .await?;
 
     info!("cleanup complete");
     Ok(())

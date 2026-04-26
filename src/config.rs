@@ -218,8 +218,8 @@ mod tests {
 
     #[test]
     fn from_env_missing_required_var_fails() {
-        // Ensure the required vars are absent.
-        // SAFETY: test-only; serialised via --test-threads=1.
+        let _lock = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialised by ENV_LOCK.
         unsafe {
             std::env::remove_var("CLOUDFLARE_API_TOKEN");
             std::env::remove_var("CLOUDFLARE_ZONE_ID");

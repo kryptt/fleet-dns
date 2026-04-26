@@ -222,13 +222,14 @@ impl CloudflareClient {
     /// Reconcile desired DNS entries against Cloudflare's live state.
     ///
     /// CNAME model:
-    /// 1. Ensure one A record for `cname_target` with the WAN IP.
+    /// 1. Ensure A records for `cname_target` and `extra_a_records` with the WAN IP.
     /// 2. For each managed service hostname, ensure a CNAME -> `cname_target`.
     /// 3. Delete orphaned `*.hr-home.xyz` records not in desired state.
     pub async fn reconcile(
         &self,
         entries: &[DnsEntry],
         wan_ip: IpAddr,
+        extra_a_records: &[String],
         dry_run: bool,
     ) -> Result<ReconcileStats, Error> {
         let a_records = self.list_records_by_type("A").await?;
@@ -296,6 +297,48 @@ impl CloudflareClient {
             }
         }
 
+        // --- Step 1b: Ensure A records for extra hostnames (e.g. MX targets) ---
+        let a_by_name: std::collections::HashMap<&str, &DnsRecord> =
+            a_records.iter().map(|r| (r.name.as_str(), r)).collect();
+
+        for extra in extra_a_records {
+            match a_by_name.get(extra.as_str()) {
+                None => {
+                    let body = CreateDnsRecord {
+                        record_type: "A".to_owned(),
+                        name: extra.clone(),
+                        content: wan_str.clone(),
+                        ttl: 300,
+                        proxied: false,
+                    };
+                    if dry_run {
+                        info!(hostname = %extra, ip = %wan_ip, "[dry-run] would create extra A record");
+                    } else {
+                        self.create_record(&body).await?;
+                        info!(hostname = %extra, ip = %wan_ip, "created extra A record");
+                    }
+                    stats.created += 1;
+                }
+                Some(record) if record.content != wan_str => {
+                    let body = CreateDnsRecord {
+                        record_type: "A".to_owned(),
+                        name: extra.clone(),
+                        content: wan_str.clone(),
+                        ttl: 300,
+                        proxied: false,
+                    };
+                    if dry_run {
+                        info!(hostname = %extra, old_ip = %record.content, new_ip = %wan_ip, "[dry-run] would update extra A record");
+                    } else {
+                        self.update_record(&record.id, &body).await?;
+                        info!(hostname = %extra, old_ip = %record.content, new_ip = %wan_ip, "updated extra A record (WAN IP changed)");
+                    }
+                    stats.updated += 1;
+                }
+                Some(_) => {}
+            }
+        }
+
         // --- Step 2: Ensure CNAME records for managed services ---
         let existing_by_name: std::collections::HashMap<&str, &DnsRecord> =
             cname_records.iter().map(|r| (r.name.as_str(), r)).collect();
@@ -305,6 +348,11 @@ impl CloudflareClient {
 
         // The cname_target itself is managed as an A record, never a CNAME.
         accounted.insert(&self.cname_target);
+
+        // Extra A records are also managed — prevent orphan deletion.
+        for extra in extra_a_records {
+            accounted.insert(extra);
+        }
 
         for entry in entries {
             if !entry.managed {

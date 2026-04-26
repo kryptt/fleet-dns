@@ -19,6 +19,7 @@ pub struct Config {
     pub default_dns_ttl: Duration,
     pub wan_interface: String,
     pub cloudflare_cname_target: String,
+    pub cloudflare_extra_a_records: Vec<String>,
     pub dry_run: bool,
 
     // Optional: Zitadel OIDC management (all must be set to enable)
@@ -60,6 +61,16 @@ impl Config {
         let cloudflare_cname_target = std::env::var("CLOUDFLARE_CNAME_TARGET")
             .unwrap_or_else(|_| "hr-main.hr-home.xyz".to_owned());
 
+        let cloudflare_extra_a_records = std::env::var("CLOUDFLARE_EXTRA_A_RECORDS")
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let dry_run = std::env::var("DRY_RUN")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -80,6 +91,7 @@ impl Config {
             default_dns_ttl,
             wan_interface,
             cloudflare_cname_target,
+            cloudflare_extra_a_records,
             dry_run,
             zitadel_url,
             zitadel_key_id,

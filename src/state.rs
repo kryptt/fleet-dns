@@ -28,6 +28,8 @@ const LABEL_PREFIX: &str = "hr-home.xyz/";
 pub enum CloudflareMode {
     Proxied,
     DnsOnly,
+    /// Create an A record pointing directly to the WAN IP instead of a CNAME.
+    Address,
     Skip,
 }
 
@@ -290,6 +292,7 @@ pub fn build_desired_state(
 
         let cloudflare_mode = match get_label(&labels, "cloudflare") {
             Some("dns-only") => CloudflareMode::DnsOnly,
+            Some("address") => CloudflareMode::Address,
             Some("skip") => CloudflareMode::Skip,
             _ => CloudflareMode::Proxied,
         };
@@ -789,6 +792,22 @@ mod tests {
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         assert_eq!(entry.cloudflare_mode, CloudflareMode::DnsOnly);
+    }
+
+    #[test]
+    fn cloudflare_address_label() {
+        let ir = make_ingress_route(
+            "system",
+            "stalwart",
+            "Host(`mail.hr-home.xyz`)",
+            "stalwart-svc",
+            labels(&[("hr-home.xyz/cloudflare", "address")]),
+        );
+
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+
+        let entry = state.get("mail.hr-home.xyz").unwrap();
+        assert_eq!(entry.cloudflare_mode, CloudflareMode::Address);
     }
 
     #[test]

@@ -79,7 +79,7 @@ struct DnsRecord {
 pub fn compute_ttl(mode: &CloudflareMode, ttl: Duration) -> u32 {
     match mode {
         CloudflareMode::Proxied => AUTO_TTL,
-        CloudflareMode::DnsOnly => {
+        CloudflareMode::Address | CloudflareMode::DnsOnly => {
             let secs = ttl.as_secs() as u32;
             secs.max(MIN_TTL)
         }
@@ -222,14 +222,13 @@ impl CloudflareClient {
     /// Reconcile desired DNS entries against Cloudflare's live state.
     ///
     /// CNAME model:
-    /// 1. Ensure A records for `cname_target` and `extra_a_records` with the WAN IP.
-    /// 2. For each managed service hostname, ensure a CNAME -> `cname_target`.
+    /// 1. Ensure A record for `cname_target` with the WAN IP.
+    /// 2. For each managed entry, ensure a CNAME (Proxied/DnsOnly) or A record (Address).
     /// 3. Delete orphaned `*.hr-home.xyz` records not in desired state.
     pub async fn reconcile(
         &self,
         entries: &[DnsEntry],
         wan_ip: IpAddr,
-        extra_a_records: &[String],
         dry_run: bool,
     ) -> Result<ReconcileStats, Error> {
         let a_records = self.list_records_by_type("A").await?;
@@ -297,49 +296,9 @@ impl CloudflareClient {
             }
         }
 
-        // --- Step 1b: Ensure A records for extra hostnames (e.g. MX targets) ---
+        // --- Step 2: Ensure DNS records for managed services ---
         let a_by_name: std::collections::HashMap<&str, &DnsRecord> =
             a_records.iter().map(|r| (r.name.as_str(), r)).collect();
-
-        for extra in extra_a_records {
-            match a_by_name.get(extra.as_str()) {
-                None => {
-                    let body = CreateDnsRecord {
-                        record_type: "A".to_owned(),
-                        name: extra.clone(),
-                        content: wan_str.clone(),
-                        ttl: 300,
-                        proxied: false,
-                    };
-                    if dry_run {
-                        info!(hostname = %extra, ip = %wan_ip, "[dry-run] would create extra A record");
-                    } else {
-                        self.create_record(&body).await?;
-                        info!(hostname = %extra, ip = %wan_ip, "created extra A record");
-                    }
-                    stats.created += 1;
-                }
-                Some(record) if record.content != wan_str => {
-                    let body = CreateDnsRecord {
-                        record_type: "A".to_owned(),
-                        name: extra.clone(),
-                        content: wan_str.clone(),
-                        ttl: 300,
-                        proxied: false,
-                    };
-                    if dry_run {
-                        info!(hostname = %extra, old_ip = %record.content, new_ip = %wan_ip, "[dry-run] would update extra A record");
-                    } else {
-                        self.update_record(&record.id, &body).await?;
-                        info!(hostname = %extra, old_ip = %record.content, new_ip = %wan_ip, "updated extra A record (WAN IP changed)");
-                    }
-                    stats.updated += 1;
-                }
-                Some(_) => {}
-            }
-        }
-
-        // --- Step 2: Ensure CNAME records for managed services ---
         let existing_by_name: std::collections::HashMap<&str, &DnsRecord> =
             cname_records.iter().map(|r| (r.name.as_str(), r)).collect();
 
@@ -348,11 +307,6 @@ impl CloudflareClient {
 
         // The cname_target itself is managed as an A record, never a CNAME.
         accounted.insert(&self.cname_target);
-
-        // Extra A records are also managed — prevent orphan deletion.
-        for extra in extra_a_records {
-            accounted.insert(extra);
-        }
 
         for entry in entries {
             if !entry.managed {
@@ -371,63 +325,102 @@ impl CloudflareClient {
             accounted.insert(&entry.hostname);
 
             let desired_ttl = compute_ttl(&entry.cloudflare_mode, entry.dns_ttl);
-            let desired_proxied = entry.cloudflare_mode == CloudflareMode::Proxied;
 
-            match existing_by_name.get(entry.hostname.as_str()) {
-                None => {
-                    let body = CreateDnsRecord {
-                        record_type: "CNAME".to_owned(),
-                        name: entry.hostname.clone(),
-                        content: self.cname_target.clone(),
-                        ttl: desired_ttl,
-                        proxied: desired_proxied,
-                    };
-                    if dry_run {
-                        info!(
-                            hostname = %entry.hostname,
-                            target = %self.cname_target,
-                            "[dry-run] would create CNAME record"
-                        );
-                    } else {
-                        self.create_record(&body).await?;
-                        info!(
-                            hostname = %entry.hostname,
-                            target = %self.cname_target,
-                            "created Cloudflare CNAME record"
-                        );
+            if entry.cloudflare_mode == CloudflareMode::Address {
+                // A record pointing directly to the WAN IP.
+                match a_by_name.get(entry.hostname.as_str()) {
+                    None => {
+                        let body = CreateDnsRecord {
+                            record_type: "A".to_owned(),
+                            name: entry.hostname.clone(),
+                            content: wan_str.clone(),
+                            ttl: desired_ttl,
+                            proxied: false,
+                        };
+                        if dry_run {
+                            info!(hostname = %entry.hostname, ip = %wan_ip, "[dry-run] would create A record");
+                        } else {
+                            self.create_record(&body).await?;
+                            info!(hostname = %entry.hostname, ip = %wan_ip, "created Cloudflare A record");
+                        }
+                        stats.created += 1;
                     }
-                    stats.created += 1;
-                }
-                Some(record)
-                    if record.content != self.cname_target
-                        || record.ttl != desired_ttl
-                        || record.proxied != desired_proxied =>
-                {
-                    let body = CreateDnsRecord {
-                        record_type: "CNAME".to_owned(),
-                        name: entry.hostname.clone(),
-                        content: self.cname_target.clone(),
-                        ttl: desired_ttl,
-                        proxied: desired_proxied,
-                    };
-                    if dry_run {
-                        info!(
-                            hostname = %entry.hostname,
-                            old_target = %record.content,
-                            "[dry-run] would update CNAME record"
-                        );
-                    } else {
-                        self.update_record(&record.id, &body).await?;
-                        info!(
-                            hostname = %entry.hostname,
-                            target = %self.cname_target,
-                            "updated Cloudflare CNAME record"
-                        );
+                    Some(record) if record.content != wan_str || record.ttl != desired_ttl => {
+                        let body = CreateDnsRecord {
+                            record_type: "A".to_owned(),
+                            name: entry.hostname.clone(),
+                            content: wan_str.clone(),
+                            ttl: desired_ttl,
+                            proxied: false,
+                        };
+                        if dry_run {
+                            info!(hostname = %entry.hostname, old_ip = %record.content, new_ip = %wan_ip, "[dry-run] would update A record");
+                        } else {
+                            self.update_record(&record.id, &body).await?;
+                            info!(hostname = %entry.hostname, ip = %wan_ip, "updated Cloudflare A record");
+                        }
+                        stats.updated += 1;
                     }
-                    stats.updated += 1;
+                    Some(_) => {}
                 }
-                Some(_) => {
-                    // Record matches desired state.
+            } else {
+                // CNAME record (Proxied or DnsOnly).
+                let desired_proxied = entry.cloudflare_mode == CloudflareMode::Proxied;
+
+                match existing_by_name.get(entry.hostname.as_str()) {
+                    None => {
+                        let body = CreateDnsRecord {
+                            record_type: "CNAME".to_owned(),
+                            name: entry.hostname.clone(),
+                            content: self.cname_target.clone(),
+                            ttl: desired_ttl,
+                            proxied: desired_proxied,
+                        };
+                        if dry_run {
+                            info!(
+                                hostname = %entry.hostname,
+                                target = %self.cname_target,
+                                "[dry-run] would create CNAME record"
+                            );
+                        } else {
+                            self.create_record(&body).await?;
+                            info!(
+                                hostname = %entry.hostname,
+                                target = %self.cname_target,
+                                "created Cloudflare CNAME record"
+                            );
+                        }
+                        stats.created += 1;
+                    }
+                    Some(record)
+                        if record.content != self.cname_target
+                            || record.ttl != desired_ttl
+                            || record.proxied != desired_proxied =>
+                    {
+                        let body = CreateDnsRecord {
+                            record_type: "CNAME".to_owned(),
+                            name: entry.hostname.clone(),
+                            content: self.cname_target.clone(),
+                            ttl: desired_ttl,
+                            proxied: desired_proxied,
+                        };
+                        if dry_run {
+                            info!(
+                                hostname = %entry.hostname,
+                                old_target = %record.content,
+                                "[dry-run] would update CNAME record"
+                            );
+                        } else {
+                            self.update_record(&record.id, &body).await?;
+                            info!(
+                                hostname = %entry.hostname,
+                                target = %self.cname_target,
+                                "updated Cloudflare CNAME record"
+                            );
+                        }
+                        stats.updated += 1;
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -531,6 +524,14 @@ mod tests {
         assert_eq!(
             compute_ttl(&CloudflareMode::DnsOnly, Duration::from_secs(0)),
             60
+        );
+    }
+
+    #[test]
+    fn compute_ttl_address_uses_configured_value() {
+        assert_eq!(
+            compute_ttl(&CloudflareMode::Address, Duration::from_secs(300)),
+            300
         );
     }
 

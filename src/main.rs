@@ -361,7 +361,7 @@ async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     // Clean up Cloudflare: reconcile with empty desired state removes all managed records.
     info!("cleaning up Cloudflare records");
     cloudflare
-        .reconcile(&[], "0.0.0.0".parse().unwrap(), &[], config.dry_run)
+        .reconcile(&[], "0.0.0.0".parse().unwrap(), config.dry_run)
         .await?;
 
     info!("cleanup complete");

@@ -240,12 +240,7 @@ impl Reconciler {
         if nat_ok {
             match self
                 .cloudflare
-                .reconcile(
-                    &all_entries,
-                    wan_ip,
-                    &self.config.cloudflare_extra_a_records,
-                    self.config.dry_run,
-                )
+                .reconcile(&all_entries, wan_ip, self.config.dry_run)
                 .await
             {
                 Ok(stats) => {

@@ -287,6 +287,12 @@ pub fn build_desired_state(
 
     for (hostname, (source, ir)) in candidates {
         let labels = ir.metadata.labels.as_ref().cloned().unwrap_or_default();
+        let annotations = ir
+            .metadata
+            .annotations
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
 
         let managed = get_label(&labels, "dns") == Some("true");
 
@@ -318,7 +324,9 @@ pub fn build_desired_state(
                 // Explicit opt-in: expose WAN if there is a macvlan IP.
                 match macvlan_ip {
                     Some(_) => {
-                        let ports = match get_label(&labels, "wan-ports") {
+                        let ports = match get_label(&annotations, "wan-ports")
+                            .or_else(|| get_label(&labels, "wan-ports"))
+                        {
                             Some(p) => parse_wan_ports(p),
                             None => backing_svc
                                 .map(infer_ports_from_service)
@@ -555,11 +563,35 @@ mod tests {
         svc_name: &str,
         labels: BTreeMap<String, String>,
     ) -> Arc<IngressRoute> {
+        make_ingress_route_with_annotations(
+            namespace,
+            name,
+            match_rule,
+            svc_name,
+            labels,
+            BTreeMap::new(),
+        )
+    }
+
+    fn make_ingress_route_with_annotations(
+        namespace: &str,
+        name: &str,
+        match_rule: &str,
+        svc_name: &str,
+        labels: BTreeMap<String, String>,
+        annotations: BTreeMap<String, String>,
+    ) -> Arc<IngressRoute> {
+        let annotations_opt = if annotations.is_empty() {
+            None
+        } else {
+            Some(annotations)
+        };
         Arc::new(IngressRoute {
             metadata: ObjectMeta {
                 namespace: Some(namespace.to_owned()),
                 name: Some(name.to_owned()),
                 labels: Some(labels),
+                annotations: annotations_opt,
                 ..Default::default()
             },
             spec: crate::traefik::IngressRouteSpec {
@@ -882,6 +914,46 @@ mod tests {
                 assert_eq!(ports.len(), 2);
                 assert_eq!(ports[0].port, 32400);
                 assert_eq!(ports[1].port, 32469);
+            }
+            WanExpose::Skip => panic!("expected Expose, got Skip"),
+        }
+    }
+
+    #[test]
+    fn wan_ports_annotation_overrides_service_ports() {
+        let ir = make_ingress_route_with_annotations(
+            "system",
+            "stalwart",
+            "Host(`mail.hr-home.xyz`)",
+            "stalwart-svc",
+            labels(&[
+                ("hr-home.xyz/dns", "true"),
+                ("hr-home.xyz/wan-expose", "true"),
+            ]),
+            labels(&[("hr-home.xyz/wan-ports", "25/tcp,587/tcp,993/tcp")]),
+        );
+        let svc = make_service(
+            "system",
+            "stalwart-svc",
+            labels(&[("app", "stalwart")]),
+            vec![(8080, "TCP")],
+        );
+        let pod = make_pod(
+            "system",
+            "stalwart-pod",
+            labels(&[("app", "stalwart")]),
+            Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.3/24"]}]"#),
+        );
+
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+
+        let entry = state.get("mail.hr-home.xyz").unwrap();
+        match &entry.wan_expose {
+            WanExpose::Expose { ports } => {
+                assert_eq!(ports.len(), 3);
+                assert_eq!(ports[0].port, 25);
+                assert_eq!(ports[1].port, 587);
+                assert_eq!(ports[2].port, 993);
             }
             WanExpose::Skip => panic!("expected Expose, got Skip"),
         }

@@ -63,6 +63,21 @@ fn dnsmasq_host_marker(hostname: &str) -> String {
     format!("{MARKER_PREFIX}dhcp:{hostname}]")
 }
 
+/// Pick the `(host, domain)` pair to send to OPNsense for a DHCP reservation.
+///
+/// DhcpReservation CRDs typically carry bare hostnames (e.g. `"kitchen-sensor"`),
+/// which would otherwise be misrouted by `split_hostname` into the domain
+/// field with an empty host. When the input is bare we keep the whole string
+/// as the host and fall back to `ZONE` for the domain.
+#[must_use]
+pub fn dhcp_host_domain(hostname: &str) -> (&str, &str) {
+    if hostname.contains('.') {
+        split_hostname(hostname)
+    } else {
+        (hostname, ZONE)
+    }
+}
+
 /// Extract the hostname from a `[fleet-dns:dhcp:{hostname}]` marker.
 ///
 /// Returns `None` if the string is not a valid DHCP host marker.
@@ -1035,7 +1050,7 @@ impl OpnSenseClient {
 
         for entry in reservations {
             let marker = dnsmasq_host_marker(&entry.hostname);
-            let (host, domain) = split_hostname(&entry.hostname);
+            let (host, domain) = dhcp_host_domain(&entry.hostname);
 
             accounted.insert(&entry.hostname);
 
@@ -1043,8 +1058,10 @@ impl OpnSenseClient {
                 Some(existing_host) => {
                     let ip_changed = existing_host.ip != entry.ip;
                     let mac_changed = existing_host.hwaddr != entry.mac;
+                    let host_changed = existing_host.host != host;
+                    let domain_changed = existing_host.domain != domain;
 
-                    if ip_changed || mac_changed {
+                    if ip_changed || mac_changed || host_changed || domain_changed {
                         if dry_run {
                             info!(
                                 hostname = %entry.hostname,
@@ -1904,6 +1921,19 @@ mod tests {
         assert_eq!(
             dnsmasq_host_marker("plex.hr-home.xyz"),
             "[fleet-dns:dhcp:plex.hr-home.xyz]"
+        );
+    }
+
+    #[test]
+    fn dhcp_host_domain_bare_hostname_uses_zone() {
+        assert_eq!(dhcp_host_domain("kitchen-sensor"), ("kitchen-sensor", ZONE));
+    }
+
+    #[test]
+    fn dhcp_host_domain_fqdn_splits() {
+        assert_eq!(
+            dhcp_host_domain("plex.hr-home.xyz"),
+            ("plex", "hr-home.xyz")
         );
     }
 

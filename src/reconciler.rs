@@ -152,6 +152,40 @@ impl Reconciler {
         let has_changes =
             !changes.add.is_empty() || !changes.update.is_empty() || !changes.remove.is_empty();
 
+        // OIDC reconciliation runs every pass — `OidcApplication` redirect
+        // URIs (and the IngressRoutes that feed them) can change without
+        // any DNS-state change, so we can't gate OIDC on `has_changes`.
+        // `reconcile_oidc` itself queries Zitadel and only writes on diff,
+        // so this is cheap when nothing has changed.
+        if let (Some(zitadel), Some(oidc_store)) = (&self.zitadel, &self.oidc_store) {
+            let oidc_apps: Vec<_> = oidc_store.state();
+            let oidc_desired = build_oidc_desired(&oidc_apps, &ingresses);
+
+            match reconcile_oidc(
+                zitadel,
+                self.kube_client.clone(),
+                &oidc_desired,
+                self.config.dry_run,
+            )
+            .await
+            {
+                Ok(stats) => {
+                    let total = stats.created + stats.updated + stats.deleted;
+                    self.metrics
+                        .records_managed
+                        .get_or_create(&target_label("oidc"))
+                        .set(total.into());
+                }
+                Err(e) => {
+                    warn!(error = %e, "OIDC reconciliation failed");
+                    self.metrics
+                        .errors_total
+                        .get_or_create(&error_label("zitadel"))
+                        .inc();
+                }
+            }
+        }
+
         if !has_changes {
             return Ok(());
         }
@@ -342,36 +376,6 @@ impl Reconciler {
         self.metrics
             .dhcp_reservations_total
             .set(all_reservations.len() as i64);
-
-        // -- OIDC (Zitadel apps + Traefik Middleware) --
-        if let (Some(zitadel), Some(oidc_store)) = (&self.zitadel, &self.oidc_store) {
-            let oidc_apps: Vec<_> = oidc_store.state();
-            let oidc_desired = build_oidc_desired(&oidc_apps, &ingresses);
-
-            match reconcile_oidc(
-                zitadel,
-                self.kube_client.clone(),
-                &oidc_desired,
-                self.config.dry_run,
-            )
-            .await
-            {
-                Ok(stats) => {
-                    let total = stats.created + stats.updated + stats.deleted;
-                    self.metrics
-                        .records_managed
-                        .get_or_create(&target_label("oidc"))
-                        .set(total.into());
-                }
-                Err(e) => {
-                    warn!(error = %e, "OIDC reconciliation failed");
-                    self.metrics
-                        .errors_total
-                        .get_or_create(&error_label("zitadel"))
-                        .inc();
-                }
-            }
-        }
 
         // 7. Update cached current state.
         *self.current_state.lock().expect("state mutex poisoned") = desired;

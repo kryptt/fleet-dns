@@ -492,12 +492,29 @@ async fn reconcile_oidc(
                 let current_uris: BTreeSet<String> =
                     existing_app.redirect_uris().iter().cloned().collect();
                 if current_uris != app.redirect_uris {
-                    if dry_run {
+                    // Zitadel rejects PUT /oidc_config with empty redirectUris
+                    // (an OIDC app must have ≥1 callback URL). When desired is
+                    // empty, that's almost always a misconfigured CRD — no
+                    // IngressRoutes labeled `hr-home.xyz/oidc: "<crd>"` matched.
+                    // Don't try to wipe Zitadel's existing URIs; warn instead.
+                    if app.redirect_uris.is_empty() {
+                        warn!(
+                            crd = name,
+                            app = app.spec.app_name,
+                            current_uris = current_uris.len(),
+                            "OidcApplication has no IngressRoutes contributing redirect URIs; \
+                             leaving Zitadel app's existing URIs in place. Add \
+                             `hr-home.xyz/oidc: \"{name}\"` to at least one IngressRoute, or \
+                             populate spec.extraRedirectUris."
+                        );
+                        stats.skipped += 1;
+                    } else if dry_run {
                         info!(
                             app = app.spec.app_name,
                             added = ?(app.redirect_uris.difference(&current_uris).collect::<Vec<_>>()),
                             "OIDC [dry-run] would update redirect URIs"
                         );
+                        stats.updated += 1;
                     } else {
                         zitadel
                             .update_oidc_config(&project_id, &existing_app.id, &redirect_uris)
@@ -507,8 +524,8 @@ async fn reconcile_oidc(
                             uris = redirect_uris.len(),
                             "updated OIDC redirect URIs"
                         );
+                        stats.updated += 1;
                     }
-                    stats.updated += 1;
                 } else {
                     stats.skipped += 1;
                 }

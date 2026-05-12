@@ -15,15 +15,15 @@ RUN rustc -vV | awk '/^host:/ {print $2}' > /tmp/target-triple && \
 
 # --- Test stage: docker buildx build --target test . ---
 FROM builder AS test
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git,sharing=locked \
     TARGET="$(cat /tmp/target-triple)" && \
     cargo test --target "$TARGET" -- --test-threads=1
 
 # --- Release build ---
 FROM builder AS release
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
-    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git,sharing=locked \
     TARGET="$(cat /tmp/target-triple)" && \
     cargo build --release --target "$TARGET" && \
     cp "target/$TARGET/release/fleet-dns" /fleet-dns

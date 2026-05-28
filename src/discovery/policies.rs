@@ -1,6 +1,5 @@
 use std::future::Future;
 
-use futures::TryStreamExt;
 use kube::runtime::WatchStreamExt;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher;
@@ -18,10 +17,7 @@ pub fn start_watcher(client: Client) -> (Store<CoreDnsPolicy>, impl Future<Outpu
     let config = watcher::Config::default();
 
     let stream = watcher(api, config).default_backoff().reflect(writer);
-
-    let handle = async move {
-        stream.try_for_each(|_| futures::future::ok(())).await.ok();
-    };
+    let handle = super::drive_watch("corednspolicy", stream);
 
     (reader, handle)
 }

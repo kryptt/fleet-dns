@@ -19,6 +19,23 @@ use fleet_dns::reconciler::Reconciler;
 use fleet_dns::targets::cloudflare::CloudflareClient;
 use fleet_dns::targets::opnsense::OpnSenseClient;
 
+/// Spawn a watch-driver future, treating its completion as fatal.
+///
+/// The driver futures from `discovery::*::start_watcher` are expected to run
+/// for the life of the process. If one ever returns, the reflector Store behind
+/// it is frozen with stale data, so we crash and let Kubernetes restart the pod
+/// with a fresh list rather than silently reconcile against a dead watch.
+fn spawn_critical(name: &'static str, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        fut.await;
+        error!(
+            watcher = name,
+            "watch driver exited; terminating process so Kubernetes restarts with a fresh resync"
+        );
+        std::process::exit(1);
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Init tracing.
@@ -58,12 +75,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dhcp_config_store, dhcp_config_handle) =
         discovery::dhcp::start_config_watcher(kube_client.clone());
 
-    tokio::spawn(ingress_handle);
-    tokio::spawn(pod_handle);
-    tokio::spawn(service_handle);
-    tokio::spawn(policy_handle);
-    tokio::spawn(reservation_handle);
-    tokio::spawn(dhcp_config_handle);
+    spawn_critical("ingressroute", ingress_handle);
+    spawn_critical("pod", pod_handle);
+    spawn_critical("service", service_handle);
+    spawn_critical("corednspolicy", policy_handle);
+    spawn_critical("dhcpreservation", reservation_handle);
+    spawn_critical("dhcpconfig", dhcp_config_handle);
 
     // 8. Build target clients.
     let cloudflare = CloudflareClient::new(
@@ -92,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client =
                 fleet_dns::targets::zitadel::ZitadelClient::new(url, key_id, user_id, private_key)?;
             let (store, handle) = discovery::oidc::start_watcher(kube_client.clone());
-            tokio::spawn(handle);
+            spawn_critical("oidcapplication", handle);
             (Some(client), Some(store))
         }
         _ => {

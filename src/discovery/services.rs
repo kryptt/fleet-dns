@@ -1,6 +1,5 @@
 use std::future::Future;
 
-use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Service;
 use kube::runtime::WatchStreamExt;
 use kube::runtime::reflector::{self, Store};
@@ -17,10 +16,7 @@ pub fn start_watcher(client: Client) -> (Store<Service>, impl Future<Output = ()
     let config = watcher::Config::default();
 
     let stream = watcher(api, config).default_backoff().reflect(writer);
-
-    let handle = async move {
-        stream.try_for_each(|_| futures::future::ok(())).await.ok();
-    };
+    let handle = super::drive_watch("service", stream);
 
     (reader, handle)
 }

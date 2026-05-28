@@ -7,8 +7,9 @@ pub mod services;
 
 use std::net::IpAddr;
 
+use futures::{Stream, StreamExt};
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// A single entry from the Multus `k8s.v1.cni.cncf.io/network-status` JSON annotation.
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +59,30 @@ pub fn parse_multus_ip(annotation: &str, network_name: &str) -> Option<IpAddr> {
             None
         }
     }
+}
+
+/// Drive a reflector-backed watch stream forever, logging transient errors
+/// instead of terminating on them.
+///
+/// `try_for_each` short-circuits on the first error `default_backoff` surfaces
+/// (e.g. a routine apiserver connection reset over a long-lived watch). That
+/// completed the driver future and silently froze the reflector Store with
+/// stale data — a dead watch that never again sees new or changed objects,
+/// while reconciles kept running against the frozen snapshot. Logging each
+/// error and continuing keeps the watch (and its Store) live. Returns only if
+/// the stream ends, which callers treat as fatal.
+pub async fn drive_watch<S, T, E>(resource: &str, stream: S)
+where
+    S: Stream<Item = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut stream = std::pin::pin!(stream);
+    while let Some(event) = stream.next().await {
+        if let Err(e) = event {
+            warn!(resource, error = %e, "watch error; backing off and retrying");
+        }
+    }
+    error!(resource, "watch stream ended unexpectedly");
 }
 
 #[cfg(test)]
@@ -128,5 +153,37 @@ mod tests {
         let annotation = r#"[{"name":"lan-macvlan","ips":["not-an-ip"]}]"#;
         let ip = parse_multus_ip(annotation, "lan-macvlan");
         assert_eq!(ip, None);
+    }
+
+    #[tokio::test]
+    async fn drive_watch_consumes_every_item_past_errors() {
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Regression guard for the swallowed-watch-death bug: a stream that
+        // interleaves Ok and Err must be drained to completion. The old
+        // `try_for_each` would stop at the first Err, leaving later items
+        // (here Ok(2), Err, Ok(3)) unpolled.
+        let polled = Arc::new(AtomicUsize::new(0));
+        let counter = polled.clone();
+        let items: Vec<Result<i32, String>> = vec![
+            Ok(1),
+            Err("transient watch error".to_owned()),
+            Ok(2),
+            Err("another transient error".to_owned()),
+            Ok(3),
+        ];
+        let stream = futures::stream::iter(items).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        drive_watch("test-resource", stream).await;
+
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            5,
+            "drive_watch must consume every item, not short-circuit on the first Err"
+        );
     }
 }

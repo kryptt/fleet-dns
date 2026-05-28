@@ -1,6 +1,5 @@
 use std::future::Future;
 
-use futures::TryStreamExt;
 use kube::runtime::WatchStreamExt;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher;
@@ -18,11 +17,7 @@ pub fn start_watcher(client: Client) -> (Store<IngressRoute>, impl Future<Output
     let config = watcher::Config::default();
 
     let stream = watcher(api, config).default_backoff().reflect(writer);
-
-    let handle = async move {
-        // Drive the stream to completion; errors are retried by default_backoff.
-        stream.try_for_each(|_| futures::future::ok(())).await.ok();
-    };
+    let handle = super::drive_watch("ingressroute", stream);
 
     (reader, handle)
 }

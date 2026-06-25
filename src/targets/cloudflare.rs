@@ -106,26 +106,23 @@ impl CloudflareClient {
     /// `cname_target` is the hostname that holds the A record (e.g.,
     /// `hr-main.hr-home.xyz`). All service hostnames become CNAMEs
     /// pointing to it.
-    pub fn new(token: &str, zone_id: &str, cname_target: &str) -> Self {
+    pub fn new(token: &str, zone_id: &str, cname_target: &str) -> Result<Self, Error> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .expect("API token must be valid ASCII"),
-        );
+        let mut auth_value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| {
+            Error::Cloudflare(format!("API token is not a valid header value: {e}"))
+        })?;
+        auth_value.set_sensitive(true);
+        headers.insert(AUTHORIZATION, auth_value);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let client = Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("failed to build reqwest client");
+        let client = Client::builder().default_headers(headers).build()?;
 
-        Self {
+        Ok(Self {
             client,
             zone_id: zone_id.to_owned(),
             base_url: "https://api.cloudflare.com/client/v4".to_owned(),
             cname_target: cname_target.to_owned(),
-        }
+        })
     }
 
     /// List all records of a given type in the zone.

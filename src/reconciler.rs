@@ -133,9 +133,14 @@ impl Reconciler {
 
         // Detect WAN IP changes.
         {
-            let mut prev = self.wan_ip.lock().expect("wan_ip mutex poisoned");
-            if prev.is_some_and(|old| old != wan_ip) {
-                info!(old = %prev.unwrap(), new = %wan_ip, "WAN IP changed");
+            let mut prev = self
+                .wan_ip
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(old) = *prev
+                && old != wan_ip
+            {
+                info!(old = %old, new = %wan_ip, "WAN IP changed");
                 self.metrics.wan_ip_changes_total.inc();
             }
             *prev = Some(wan_ip);
@@ -145,7 +150,7 @@ impl Reconciler {
         let current = self
             .current_state
             .lock()
-            .expect("state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let changes = diff(&desired, &current);
 
@@ -378,7 +383,10 @@ impl Reconciler {
             .set(all_reservations.len() as i64);
 
         // 7. Update cached current state.
-        *self.current_state.lock().expect("state mutex poisoned") = desired;
+        *self
+            .current_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = desired;
 
         Ok(())
     }
@@ -680,22 +688,29 @@ async fn ensure_middleware(
         fnv1a_128(format!("fleet-dns-oidc-{mw_name}-{client_id}").as_bytes())
     );
 
-    let mut oidc_auth = serde_json::json!({
-        "Secret": secret,
-        "Provider": {
+    // Assemble the OIDC config into a `serde_json::Map` directly so the
+    // optional `Headers` key can be inserted without a post-hoc
+    // `as_object_mut().unwrap()` on a `Value`. `Headers` stays absent (not
+    // null) when empty, matching the Traefik plugin's expectations.
+    let mut oidc_fields = serde_json::Map::new();
+    oidc_fields.insert("Secret".to_owned(), serde_json::json!(secret));
+    oidc_fields.insert(
+        "Provider".to_owned(),
+        serde_json::json!({
             "Url": ZITADEL_URL,
             "ClientId": client_id,
             "UsePkce": true,
             "ValidAudience": project_id,
-        },
-        "Scopes": &mw.scopes,
-        "AuthorizationHeader": {
-            "Name": "Authorization"
-        }
-    });
+        }),
+    );
+    oidc_fields.insert("Scopes".to_owned(), serde_json::json!(&mw.scopes));
+    oidc_fields.insert(
+        "AuthorizationHeader".to_owned(),
+        serde_json::json!({ "Name": "Authorization" }),
+    );
 
     if !mw.headers.is_empty() {
-        oidc_auth.as_object_mut().unwrap().insert(
+        oidc_fields.insert(
             "Headers".to_owned(),
             serde_json::json!(
                 mw.headers
@@ -708,6 +723,8 @@ async fn ensure_middleware(
             ),
         );
     }
+
+    let oidc_auth = serde_json::Value::Object(oidc_fields);
 
     let middleware_json = serde_json::json!({
         "apiVersion": "traefik.io/v1alpha1",

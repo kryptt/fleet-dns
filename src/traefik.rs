@@ -6,6 +6,17 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Compiled regex for extracting Host() patterns from Traefik match rules.
+// The pattern is a compile-time constant; `Regex::new` can only fail if this
+// literal is malformed, which the `extract_hostnames` unit tests below would
+// catch on the first `LazyLock` deref. A runtime panic here is the correct
+// (and unreachable in a tested build) outcome.
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::expect_used,
+        reason = "constant regex literal, validated by unit tests"
+    )
+)]
 static HOST_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(Host(?:Regexp)?)\(`([^`]+)`\)").expect("valid regex"));
 

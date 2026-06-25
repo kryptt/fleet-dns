@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -87,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.cloudflare_api_token,
         &config.cloudflare_zone_id,
         &config.cloudflare_cname_target,
-    );
+    )?;
     let opnsense = OpnSenseClient::new(
         &config.opnsense_url,
         &config.opnsense_api_key,
@@ -310,7 +312,7 @@ async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
         &config.cloudflare_api_token,
         &config.cloudflare_zone_id,
         &config.cloudflare_cname_target,
-    );
+    )?;
 
     // Clean up OPNsense Unbound host overrides.
     let overrides = opnsense.search_host_overrides().await?;
@@ -376,9 +378,15 @@ async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // Clean up Cloudflare: reconcile with empty desired state removes all managed records.
+    // The WAN IP only matters for A-record content; with no desired entries it is
+    // unused, so the unspecified address (0.0.0.0) is a safe, infallible placeholder.
     info!("cleaning up Cloudflare records");
     cloudflare
-        .reconcile(&[], "0.0.0.0".parse().unwrap(), config.dry_run)
+        .reconcile(
+            &[],
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            config.dry_run,
+        )
         .await?;
 
     info!("cleanup complete");

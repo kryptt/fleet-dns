@@ -202,7 +202,7 @@ impl ZitadelClient {
     fn build_assertion(&self) -> Result<String, Error> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
+            .map_err(|e| Error::Zitadel(format!("system clock is before the UNIX epoch: {e}")))?
             .as_secs();
 
         let claims = JwtClaims {

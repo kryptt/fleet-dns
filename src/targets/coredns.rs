@@ -7,7 +7,6 @@ use kube::api::{ObjectMeta, Patch, PatchParams};
 use kube::{Api, Client};
 use tracing::{debug, info};
 
-use crate::ZONE;
 use crate::crd::CoreDnsPolicy;
 use crate::error::Error;
 use crate::state::DnsEntry;
@@ -30,6 +29,7 @@ const CONFIGMAP_NAMESPACE: &str = "kube-system";
 pub fn render_configmap_data(
     entries: &[DnsEntry],
     policies: &[Arc<CoreDnsPolicy>],
+    zone: &str,
 ) -> BTreeMap<String, String> {
     let mut data = BTreeMap::new();
 
@@ -41,27 +41,31 @@ pub fn render_configmap_data(
     }
 
     // --- Zone server block ---
-    let server_block = render_server_block(entries, policies);
+    let server_block = render_server_block(entries, policies, zone);
     data.insert(SERVER_KEY.to_owned(), server_block);
 
     data
 }
 
 /// Build the `hr-home.xyz:53 { ... }` server block.
-fn render_server_block(entries: &[DnsEntry], policies: &[Arc<CoreDnsPolicy>]) -> String {
+fn render_server_block(
+    entries: &[DnsEntry],
+    policies: &[Arc<CoreDnsPolicy>],
+    zone: &str,
+) -> String {
     // Group hostnames by lan_ip, sorted for determinism.
     let hosts_block = render_hosts_block(entries);
 
     // Collect zone-scoped policy content fragments.
     let mut zone_policies: Vec<&str> = policies
         .iter()
-        .filter(|p| p.spec.zone.as_deref() == Some(ZONE))
+        .filter(|p| p.spec.zone.as_deref() == Some(zone))
         .map(|p| p.spec.content.as_str())
         .collect();
     zone_policies.sort();
 
     let mut out = String::new();
-    let _ = writeln!(out, "{ZONE}:53 {{");
+    let _ = writeln!(out, "{zone}:53 {{");
     let _ = writeln!(out, "  errors");
     let _ = writeln!(out, "  hosts {{");
 
@@ -159,6 +163,7 @@ pub async fn apply_configmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Zones;
     use crate::crd::CoreDnsPolicySpec;
     use crate::state::{CloudflareMode, WanExpose};
     use kube::api::ObjectMeta;
@@ -211,7 +216,7 @@ mod tests {
             policy("search-fix.override", search_content, Some("hr-home.xyz")),
         ];
 
-        let data = render_configmap_data(&entries, &policies);
+        let data = render_configmap_data(&entries, &policies, &Zones::test().zone);
 
         // Non-zone policy gets its own key.
         assert_eq!(data.get("no-aaaa.override").unwrap(), aaaa_content);
@@ -252,7 +257,7 @@ mod tests {
             entry("bravo.hr-home.xyz", "10.43.0.100"),
         ];
 
-        let data = render_configmap_data(&entries, &[]);
+        let data = render_configmap_data(&entries, &[], &Zones::test().zone);
         let server = data.get(SERVER_KEY).unwrap();
 
         // All three on one line, sorted alphabetically.
@@ -267,7 +272,7 @@ mod tests {
         let template = "template IN CNAME search.hr-home.xyz {\n  answer \"...\"\n}";
         let policies = vec![policy("search.override", template, Some("hr-home.xyz"))];
 
-        let data = render_configmap_data(&entries, &policies);
+        let data = render_configmap_data(&entries, &policies, &Zones::test().zone);
         let server = data.get(SERVER_KEY).unwrap();
 
         let hosts_close = server.find("  }").unwrap();
@@ -283,7 +288,7 @@ mod tests {
         let template = "template IN AAAA {\n  rcode NXDOMAIN\n}";
         let policies = vec![policy("no-aaaa.override", template, None)];
 
-        let data = render_configmap_data(&[], &policies);
+        let data = render_configmap_data(&[], &policies, &Zones::test().zone);
         let server = data.get(SERVER_KEY).unwrap();
 
         // Hosts block should contain only fallthrough (no IP lines).
@@ -309,8 +314,8 @@ mod tests {
             entry("middle.hr-home.xyz", "172.16.0.5"),
         ];
 
-        let data_a = render_configmap_data(&entries, &[]);
-        let data_b = render_configmap_data(&entries, &[]);
+        let data_a = render_configmap_data(&entries, &[], &Zones::test().zone);
+        let data_b = render_configmap_data(&entries, &[], &Zones::test().zone);
 
         assert_eq!(data_a, data_b, "output must be deterministic");
 

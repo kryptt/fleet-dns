@@ -121,7 +121,8 @@ impl Reconciler {
         let traefik_ip = find_traefik_ip(&pods)?;
 
         // 3. Build desired state.
-        let mut desired = build_desired_state(&ingresses, &pods, &services, traefik_ip);
+        let mut desired =
+            build_desired_state(&ingresses, &pods, &services, traefik_ip, &self.config.zones);
 
         // 3b. Merge DHCP reservations into DNS state.
         let reservations: Vec<_> = self.reservation_store.state();
@@ -166,10 +167,12 @@ impl Reconciler {
             let oidc_apps: Vec<_> = oidc_store.state();
             let oidc_desired = build_oidc_desired(&oidc_apps, &ingresses);
 
+            let zitadel_url = self.config.zitadel_url.as_deref().unwrap_or_default();
             match reconcile_oidc(
                 zitadel,
                 self.kube_client.clone(),
                 &oidc_desired,
+                zitadel_url,
                 self.config.dry_run,
             )
             .await
@@ -255,7 +258,8 @@ impl Reconciler {
         }
 
         // -- CoreDNS (internal, ALL entries unconditionally) --
-        let configmap_data = coredns::render_configmap_data(&all_entries, &policies);
+        let configmap_data =
+            coredns::render_configmap_data(&all_entries, &policies, &self.config.zones.zone);
         if let Err(e) = coredns::apply_configmap(
             self.kube_client.clone(),
             configmap_data,
@@ -459,16 +463,17 @@ fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
 // OIDC reconciliation
 // ---------------------------------------------------------------------------
 
-/// Zitadel URL used in generated Middlewares.
-const ZITADEL_URL: &str = "https://zitadel.hr-home.xyz";
-
 /// Reconcile OIDC applications: ensure each `OidcAppDesired` has a
 /// corresponding Zitadel app and Traefik Middleware, with up-to-date
 /// redirect URIs.
+///
+/// `zitadel_url` is the issuer URL embedded in generated Middlewares,
+/// sourced from `Config.zitadel_url` (env `ZITADEL_URL`).
 async fn reconcile_oidc(
     zitadel: &ZitadelClient,
     kube: Client,
     desired: &BTreeMap<String, OidcAppDesired>,
+    zitadel_url: &str,
     dry_run: bool,
 ) -> Result<ReconcileStats, Error> {
     let mut stats = ReconcileStats::default();
@@ -540,7 +545,15 @@ async fn reconcile_oidc(
 
                 // Ensure Middleware exists (requires a valid client_id).
                 if let Some(client_id) = existing_app.client_id() {
-                    ensure_middleware(&kube, &app.spec, client_id, &project_id, dry_run).await?;
+                    ensure_middleware(
+                        &kube,
+                        &app.spec,
+                        client_id,
+                        &project_id,
+                        zitadel_url,
+                        dry_run,
+                    )
+                    .await?;
                 } else {
                     warn!(
                         app = app.spec.app_name,
@@ -568,7 +581,15 @@ async fn reconcile_oidc(
                         "created OIDC app in Zitadel"
                     );
 
-                    ensure_middleware(&kube, &app.spec, &client_id, &project_id, dry_run).await?;
+                    ensure_middleware(
+                        &kube,
+                        &app.spec,
+                        &client_id,
+                        &project_id,
+                        zitadel_url,
+                        dry_run,
+                    )
+                    .await?;
                 }
                 stats.created += 1;
             }
@@ -665,6 +686,7 @@ async fn ensure_middleware(
     spec: &crate::crd::OidcApplicationSpec,
     client_id: &str,
     project_id: &str,
+    zitadel_url: &str,
     dry_run: bool,
 ) -> Result<(), Error> {
     let mw = &spec.middleware;
@@ -697,7 +719,7 @@ async fn ensure_middleware(
     oidc_fields.insert(
         "Provider".to_owned(),
         serde_json::json!({
-            "Url": ZITADEL_URL,
+            "Url": zitadel_url,
             "ClientId": client_id,
             "UsePkce": true,
             "ValidAudience": project_id,

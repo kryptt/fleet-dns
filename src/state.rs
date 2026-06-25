@@ -6,10 +6,10 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use tracing::{info, warn};
 
+use crate::Zones;
 use crate::crd::DhcpReservation;
 use crate::discovery::parse_multus_ip;
 use crate::traefik::{IngressRoute, extract_hostnames};
-use crate::{MANAGED_ZONE, UNBOUND_ANCHOR, ZONE};
 
 /// The Multus network attachment name used for LAN macvlan interfaces.
 const MACVLAN_NETWORK: &str = "lan-macvlan";
@@ -243,6 +243,7 @@ pub fn build_desired_state(
     pod_store: &[Arc<Pod>],
     service_store: &[Arc<Service>],
     traefik_ip: IpAddr,
+    zones: &Zones,
 ) -> DnsState {
     // Collect all (hostname, source_key, IngressRoute) tuples, then deduplicate.
     let mut candidates: HashMap<String, (String, &IngressRoute)> = HashMap::new();
@@ -252,7 +253,7 @@ pub fn build_desired_state(
 
         for route in &ir.spec.routes {
             for hostname in extract_hostnames(&route.match_rule) {
-                if !hostname.ends_with(MANAGED_ZONE) && hostname != ZONE {
+                if !hostname.ends_with(zones.managed_zone.as_str()) && hostname != zones.zone {
                     continue;
                 }
 
@@ -374,7 +375,7 @@ pub fn build_desired_state(
         return state;
     }
 
-    let anchor = UNBOUND_ANCHOR.to_owned();
+    let anchor = zones.unbound_anchor.clone();
 
     // Ensure the anchor entry exists as an A record.
     if !state.contains_key(&anchor) {
@@ -414,11 +415,12 @@ pub fn build_desired_state(
         // (traefik_ip). If they're the same there's no conflict.
         if let Some(mvip) = entry.macvlan_ip.filter(|&ip| ip != entry.lan_ip) {
             let direct_host = format!(
-                "{}-direct.{ZONE}",
+                "{}-direct.{}",
                 entry
                     .hostname
-                    .strip_suffix(&format!(".{ZONE}"))
-                    .unwrap_or(&entry.hostname)
+                    .strip_suffix(&format!(".{}", zones.zone))
+                    .unwrap_or(&entry.hostname),
+                zones.zone
             );
             direct_entries.push(DnsEntry {
                 hostname: direct_host,
@@ -690,6 +692,10 @@ mod tests {
         "10.43.0.100".parse().unwrap()
     }
 
+    fn zones() -> Zones {
+        Zones::test()
+    }
+
     // ---- Tests ----
 
     #[test]
@@ -714,17 +720,14 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.51/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         // Main entry becomes an alias to the anchor.
         let entry = state.get("hass.hr-home.xyz").expect("entry must exist");
         assert_eq!(entry.lan_ip, traefik_ip());
         assert_eq!(entry.macvlan_ip, Some("192.168.2.51".parse().unwrap()));
         assert!(entry.managed);
-        assert_eq!(
-            entry.unbound_alias_target,
-            Some(crate::UNBOUND_ANCHOR.to_owned())
-        );
+        assert_eq!(entry.unbound_alias_target, Some(zones().unbound_anchor));
 
         // Direct entry is emitted for the macvlan IP.
         let direct = state
@@ -736,7 +739,9 @@ mod tests {
         assert_eq!(direct.unbound_alias_target, None);
 
         // Anchor entry is synthesized.
-        let anchor = state.get(crate::UNBOUND_ANCHOR).expect("anchor must exist");
+        let anchor = state
+            .get(zones().unbound_anchor.as_str())
+            .expect("anchor must exist");
         assert_eq!(anchor.lan_ip, traefik_ip());
         assert_eq!(anchor.unbound_alias_target, None);
         assert!(anchor.managed);
@@ -759,15 +764,12 @@ mod tests {
         );
         let pod = make_pod("media", "plex-pod", labels(&[("app", "plex")]), None);
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         assert_eq!(entry.lan_ip, traefik_ip());
         assert_eq!(entry.macvlan_ip, None);
-        assert_eq!(
-            entry.unbound_alias_target,
-            Some(crate::UNBOUND_ANCHOR.to_owned())
-        );
+        assert_eq!(entry.unbound_alias_target, Some(zones().unbound_anchor));
         // No -direct entry since no macvlan IP.
         assert!(!state.contains_key("plex-direct.hr-home.xyz"));
     }
@@ -788,7 +790,7 @@ mod tests {
             vec![(5000, "TCP")],
         );
 
-        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("registry.hr-home.xyz").unwrap();
         assert!(!entry.managed);
@@ -804,7 +806,7 @@ mod tests {
             labels(&[("hr-home.xyz/dns", "true")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         assert!(entry.managed);
@@ -820,7 +822,7 @@ mod tests {
             labels(&[("hr-home.xyz/cloudflare", "dns-only")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         assert_eq!(entry.cloudflare_mode, CloudflareMode::DnsOnly);
@@ -836,7 +838,7 @@ mod tests {
             labels(&[("hr-home.xyz/cloudflare", "address")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         let entry = state.get("mail.hr-home.xyz").unwrap();
         assert_eq!(entry.cloudflare_mode, CloudflareMode::Address);
@@ -867,7 +869,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.52/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         match &entry.wan_expose {
@@ -906,7 +908,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.52/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         match &entry.wan_expose {
@@ -945,7 +947,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.3/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("mail.hr-home.xyz").unwrap();
         match &entry.wan_expose {
@@ -981,7 +983,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.52/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         assert_eq!(entry.wan_expose, WanExpose::Skip);
@@ -1109,7 +1111,7 @@ mod tests {
             labels(&[("hr-home.xyz/dns", "true")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         assert!(state.is_empty());
     }
@@ -1131,7 +1133,7 @@ mod tests {
         );
         // No pods at all (Sablier scaled to zero).
 
-        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("calibre.hr-home.xyz").unwrap();
         assert_eq!(entry.lan_ip, traefik_ip());
@@ -1156,7 +1158,7 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let state = build_desired_state(&[ir_a, ir_b], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir_a, ir_b], &[], &[], traefik_ip(), &zones());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         // "home/hass" < "ingress/hass-redirect" lexicographically
@@ -1184,7 +1186,7 @@ mod tests {
             labels(&[("hr-home.xyz/reconcile-interval", "bogus")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         assert_eq!(entry.reconcile_interval, Duration::from_secs(300));
@@ -1228,7 +1230,7 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         assert!(state.contains_key("hr-home.xyz"));
     }
@@ -1255,7 +1257,7 @@ mod tests {
             None, // no macvlan
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         let entry = state.get("registry.hr-home.xyz").unwrap();
         assert_eq!(entry.wan_expose, WanExpose::Skip);
@@ -1269,7 +1271,7 @@ mod tests {
         let ir = make_ingress_route(
             "home",
             "ha",
-            &format!("Host(`{}`)", crate::UNBOUND_ANCHOR),
+            &format!("Host(`{}`)", zones().unbound_anchor),
             "ha-svc",
             labels(&[("hr-home.xyz/dns", "true")]),
         );
@@ -1286,10 +1288,12 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.50/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
 
         // Anchor is an A record (no alias target), pointing to traefik_ip.
-        let anchor = state.get(crate::UNBOUND_ANCHOR).expect("anchor must exist");
+        let anchor = state
+            .get(zones().unbound_anchor.as_str())
+            .expect("anchor must exist");
         assert_eq!(anchor.lan_ip, traefik_ip());
         assert_eq!(anchor.macvlan_ip, None);
         assert_eq!(anchor.unbound_alias_target, None);
@@ -1309,10 +1313,12 @@ mod tests {
             labels(&[("hr-home.xyz/dns", "true")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         // Anchor is injected synthetically.
-        let anchor = state.get(crate::UNBOUND_ANCHOR).expect("anchor must exist");
+        let anchor = state
+            .get(zones().unbound_anchor.as_str())
+            .expect("anchor must exist");
         assert_eq!(anchor.lan_ip, traefik_ip());
         assert_eq!(anchor.unbound_alias_target, None);
         assert!(anchor.managed);
@@ -1320,10 +1326,7 @@ mod tests {
 
         // Plex entry is an alias.
         let entry = state.get("plex.hr-home.xyz").unwrap();
-        assert_eq!(
-            entry.unbound_alias_target,
-            Some(crate::UNBOUND_ANCHOR.to_owned())
-        );
+        assert_eq!(entry.unbound_alias_target, Some(zones().unbound_anchor));
     }
 
     // ---- DHCP reservation merge tests ----
@@ -1357,7 +1360,7 @@ mod tests {
             "hass-svc",
             labels(&[("hr-home.xyz/dns", "true")]),
         );
-        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         let reservation = make_dhcp_reservation("hass", "aa:bb:cc:dd:ee:ff", "192.168.2.50");
         merge_dhcp_reservations(&mut state, &[reservation]);
@@ -1377,7 +1380,7 @@ mod tests {
             "hass-svc",
             labels(&[("hr-home.xyz/dns", "true")]),
         );
-        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip());
+        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
 
         let reservation = make_dhcp_reservation("hass", "aa:bb:cc:dd:ee:ff", "192.168.2.50");
         let returned = merge_dhcp_reservations(&mut state, std::slice::from_ref(&reservation));

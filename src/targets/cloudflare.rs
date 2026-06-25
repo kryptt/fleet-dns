@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::error::Error;
 use crate::state::{CloudflareMode, DnsEntry};
-use crate::{MANAGED_ZONE, ReconcileStats, ZONE};
+use crate::{ReconcileStats, Zones};
 
 /// Minimum TTL Cloudflare accepts for non-proxied records.
 const MIN_TTL: u32 = 60;
@@ -25,6 +25,7 @@ pub struct CloudflareClient {
     zone_id: String,
     base_url: String,
     cname_target: String,
+    zones: Zones,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +107,12 @@ impl CloudflareClient {
     /// `cname_target` is the hostname that holds the A record (e.g.,
     /// `hr-main.hr-home.xyz`). All service hostnames become CNAMEs
     /// pointing to it.
-    pub fn new(token: &str, zone_id: &str, cname_target: &str) -> Result<Self, Error> {
+    pub fn new(
+        token: &str,
+        zone_id: &str,
+        cname_target: &str,
+        zones: &Zones,
+    ) -> Result<Self, Error> {
         let mut headers = HeaderMap::new();
         let mut auth_value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| {
             Error::Cloudflare(format!("API token is not a valid header value: {e}"))
@@ -122,6 +128,7 @@ impl CloudflareClient {
             zone_id: zone_id.to_owned(),
             base_url: "https://api.cloudflare.com/client/v4".to_owned(),
             cname_target: cname_target.to_owned(),
+            zones: zones.clone(),
         })
     }
 
@@ -425,7 +432,8 @@ impl CloudflareClient {
         // --- Step 3: Delete orphaned records ---
         // Delete orphaned CNAMEs in *.hr-home.xyz
         for record in &cname_records {
-            let in_zone = record.name.ends_with(MANAGED_ZONE) || record.name == ZONE;
+            let in_zone = record.name.ends_with(self.zones.managed_zone.as_str())
+                || record.name == self.zones.zone;
             if in_zone && !accounted.contains(record.name.as_str()) {
                 if dry_run {
                     info!(
@@ -442,7 +450,8 @@ impl CloudflareClient {
 
         // Delete orphaned A records in *.hr-home.xyz (except cname_target)
         for record in &a_records {
-            let in_zone = record.name.ends_with(MANAGED_ZONE) || record.name == ZONE;
+            let in_zone = record.name.ends_with(self.zones.managed_zone.as_str())
+                || record.name == self.zones.zone;
             if in_zone
                 && record.name != self.cname_target
                 && !accounted.contains(record.name.as_str())

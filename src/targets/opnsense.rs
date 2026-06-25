@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use crate::crd::DhcpConfigSpec;
 use crate::error::Error;
 use crate::state::{DnsEntry, Protocol, WanExpose};
-use crate::{ReconcileStats, ZONE};
+use crate::{ReconcileStats, Zones};
 
 /// Marker prefix embedded in OPNsense descriptions to identify fleet-dns-managed entries.
 const MARKER_PREFIX: &str = "[fleet-dns:";
@@ -68,13 +68,13 @@ fn dnsmasq_host_marker(hostname: &str) -> String {
 /// DhcpReservation CRDs typically carry bare hostnames (e.g. `"kitchen-sensor"`),
 /// which would otherwise be misrouted by `split_hostname` into the domain
 /// field with an empty host. When the input is bare we keep the whole string
-/// as the host and fall back to `ZONE` for the domain.
+/// as the host and fall back to `zone` for the domain.
 #[must_use]
-pub fn dhcp_host_domain(hostname: &str) -> (&str, &str) {
+pub fn dhcp_host_domain<'a>(hostname: &'a str, zone: &'a str) -> (&'a str, &'a str) {
     if hostname.contains('.') {
         split_hostname(hostname)
     } else {
-        (hostname, ZONE)
+        (hostname, zone)
     }
 }
 
@@ -465,12 +465,18 @@ pub struct OpnSenseClient {
     base_url: String,
     api_key: String,
     api_secret: String,
+    zones: Zones,
 }
 
 impl OpnSenseClient {
     /// Create a client with HTTP Basic Auth and TLS verification disabled
     /// (OPNsense typically uses a self-signed certificate).
-    pub fn new(base_url: &str, api_key: &str, api_secret: &str) -> Result<Self, Error> {
+    pub fn new(
+        base_url: &str,
+        api_key: &str,
+        api_secret: &str,
+        zones: &Zones,
+    ) -> Result<Self, Error> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
@@ -481,6 +487,7 @@ impl OpnSenseClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
             api_secret: api_secret.to_owned(),
+            zones: zones.clone(),
         })
     }
 
@@ -805,18 +812,22 @@ impl OpnSenseClient {
         // -- Phase 2: host aliases --
         // Find the anchor override UUID (needed as parent for all aliases).
         // Re-fetch overrides if we just created the anchor in Phase 1.
-        let anchor_uuid = if let Some(existing) = existing_by_marker.get(crate::UNBOUND_ANCHOR) {
-            Some(existing.uuid.clone())
-        } else if !dry_run {
-            // Anchor was just created — re-fetch to get its UUID.
-            let refreshed = self.search_host_overrides().await?;
-            refreshed
-                .iter()
-                .find(|o| extract_marker_payload(&o.description) == Some(crate::UNBOUND_ANCHOR))
-                .map(|o| o.uuid.clone())
-        } else {
-            None
-        };
+        let anchor_uuid =
+            if let Some(existing) = existing_by_marker.get(self.zones.unbound_anchor.as_str()) {
+                Some(existing.uuid.clone())
+            } else if !dry_run {
+                // Anchor was just created — re-fetch to get its UUID.
+                let refreshed = self.search_host_overrides().await?;
+                refreshed
+                    .iter()
+                    .find(|o| {
+                        extract_marker_payload(&o.description)
+                            == Some(self.zones.unbound_anchor.as_str())
+                    })
+                    .map(|o| o.uuid.clone())
+            } else {
+                None
+            };
 
         if !alias_entries.is_empty() {
             match &anchor_uuid {
@@ -840,7 +851,7 @@ impl OpnSenseClient {
                                 if dry_run {
                                     info!(
                                         hostname = %entry.hostname,
-                                        anchor = crate::UNBOUND_ANCHOR,
+                                        anchor = self.zones.unbound_anchor.as_str(),
                                         "[dry-run] would create Unbound host alias"
                                     );
                                 } else {
@@ -848,7 +859,7 @@ impl OpnSenseClient {
                                         .await?;
                                     info!(
                                         hostname = %entry.hostname,
-                                        anchor = crate::UNBOUND_ANCHOR,
+                                        anchor = self.zones.unbound_anchor.as_str(),
                                         "created Unbound host alias"
                                     );
                                 }
@@ -860,7 +871,7 @@ impl OpnSenseClient {
                 None => {
                     warn!(
                         "anchor override {} not found; skipping {} alias entries",
-                        crate::UNBOUND_ANCHOR,
+                        self.zones.unbound_anchor,
                         alias_entries.len()
                     );
                     stats.skipped += alias_entries.len() as u32;
@@ -1050,7 +1061,7 @@ impl OpnSenseClient {
 
         for entry in reservations {
             let marker = dnsmasq_host_marker(&entry.hostname);
-            let (host, domain) = dhcp_host_domain(&entry.hostname);
+            let (host, domain) = dhcp_host_domain(&entry.hostname, &self.zones.zone);
 
             accounted.insert(&entry.hostname);
 
@@ -1191,7 +1202,7 @@ impl OpnSenseClient {
                 start_addr: start.to_owned(),
                 end_addr: end.to_owned(),
                 lease_time: lease_time.to_owned(),
-                domain: ZONE.to_owned(),
+                domain: self.zones.zone.clone(),
                 description: description.to_owned(),
             },
         };
@@ -1215,7 +1226,7 @@ impl OpnSenseClient {
                 start_addr: start.to_owned(),
                 end_addr: end.to_owned(),
                 lease_time: lease_time.to_owned(),
-                domain: ZONE.to_owned(),
+                domain: self.zones.zone.clone(),
                 description: description.to_owned(),
             },
         };
@@ -1926,13 +1937,18 @@ mod tests {
 
     #[test]
     fn dhcp_host_domain_bare_hostname_uses_zone() {
-        assert_eq!(dhcp_host_domain("kitchen-sensor"), ("kitchen-sensor", ZONE));
+        let z = Zones::test();
+        assert_eq!(
+            dhcp_host_domain("kitchen-sensor", &z.zone),
+            ("kitchen-sensor", z.zone.as_str())
+        );
     }
 
     #[test]
     fn dhcp_host_domain_fqdn_splits() {
+        let z = Zones::test();
         assert_eq!(
-            dhcp_host_domain("plex.hr-home.xyz"),
+            dhcp_host_domain("plex.hr-home.xyz", &z.zone),
             ("plex", "hr-home.xyz")
         );
     }

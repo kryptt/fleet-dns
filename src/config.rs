@@ -21,11 +21,62 @@ pub struct Config {
     pub cloudflare_cname_target: String,
     pub dry_run: bool,
 
+    /// DNS zone configuration (zone suffix + Unbound anchor hostname).
+    pub zones: Zones,
+
     // Optional: Zitadel OIDC management (all must be set to enable)
     pub zitadel_url: Option<String>,
     pub zitadel_key_id: Option<String>,
     pub zitadel_user_id: Option<String>,
     pub zitadel_private_key: Option<String>,
+}
+
+/// DNS zone configuration. Loaded from env so a deployment can manage its own
+/// zone without recompiling.
+///
+/// - `zone` — the bare zone name (e.g. `example.com`), from `DNS_ZONE`.
+/// - `managed_zone` — the leading-dot suffix (`.example.com`). Derived from
+///   `zone` unless `DNS_MANAGED_ZONE` is set explicitly.
+/// - `unbound_anchor` — the Unbound anchor hostname that holds the Traefik
+///   macvlan A record; all IngressRoute hostnames become aliases of it. From
+///   `UNBOUND_ANCHOR`, defaulting to `ha.{zone}`.
+#[derive(Debug, Clone)]
+pub struct Zones {
+    pub zone: String,
+    pub managed_zone: String,
+    pub unbound_anchor: String,
+}
+
+impl Zones {
+    /// Load zone configuration from environment variables.
+    ///
+    /// Optional (with defaults):
+    /// - `DNS_ZONE` (default `"example.com"`)
+    /// - `DNS_MANAGED_ZONE` (default: `.{DNS_ZONE}`)
+    /// - `UNBOUND_ANCHOR` (default: `ha.{DNS_ZONE}`)
+    pub fn from_env() -> Self {
+        let zone = std::env::var("DNS_ZONE").unwrap_or_else(|_| "example.com".to_owned());
+        let managed_zone = std::env::var("DNS_MANAGED_ZONE").unwrap_or_else(|_| format!(".{zone}"));
+        let unbound_anchor =
+            std::env::var("UNBOUND_ANCHOR").unwrap_or_else(|_| format!("ha.{zone}"));
+        Self {
+            zone,
+            managed_zone,
+            unbound_anchor,
+        }
+    }
+
+    /// Fixed zone configuration used by unit tests. Mirrors the historical
+    /// compiled-in defaults so existing test fixtures keep their hostnames.
+    #[cfg(test)]
+    #[must_use]
+    pub fn test() -> Self {
+        Self {
+            zone: "hr-home.xyz".to_owned(),
+            managed_zone: ".hr-home.xyz".to_owned(),
+            unbound_anchor: "ha.hr-home.xyz".to_owned(),
+        }
+    }
 }
 
 impl Config {
@@ -43,7 +94,13 @@ impl Config {
     /// - `DEFAULT_DNS_TTL` (default `"300s"`)
     /// - `WAN_INTERFACE` (default `"wan"`)
     /// - `DRY_RUN` (default `"false"`)
+    /// - `DNS_ZONE` (default `"example.com"`)
+    /// - `DNS_MANAGED_ZONE` (default: `.{DNS_ZONE}`)
+    /// - `UNBOUND_ANCHOR` (default: `ha.{DNS_ZONE}`)
+    /// - `CLOUDFLARE_CNAME_TARGET` (default: `origin.{DNS_ZONE}`)
     pub fn from_env() -> Result<Self, Error> {
+        let zones = Zones::from_env();
+        let zone = zones.zone.clone();
         let cloudflare_api_token = require_env("CLOUDFLARE_API_TOKEN")?;
         let cloudflare_zone_id = require_env("CLOUDFLARE_ZONE_ID")?;
         let opnsense_url = require_env("OPNSENSE_URL")?;
@@ -57,8 +114,8 @@ impl Config {
 
         let wan_interface = std::env::var("WAN_INTERFACE").unwrap_or_else(|_| "wan".to_owned());
 
-        let cloudflare_cname_target = std::env::var("CLOUDFLARE_CNAME_TARGET")
-            .unwrap_or_else(|_| "hr-main.hr-home.xyz".to_owned());
+        let cloudflare_cname_target =
+            std::env::var("CLOUDFLARE_CNAME_TARGET").unwrap_or_else(|_| format!("origin.{zone}"));
 
         let dry_run = std::env::var("DRY_RUN")
             .map(|v| v == "true" || v == "1")
@@ -81,6 +138,7 @@ impl Config {
             wan_interface,
             cloudflare_cname_target,
             dry_run,
+            zones,
             zitadel_url,
             zitadel_key_id,
             zitadel_user_id,

@@ -27,19 +27,23 @@ use crate::traefik::IngressRoute;
 /// Holds references to all stores and target clients. The reconcile loop
 /// calls [`Reconciler::run_once`] on each trigger.
 pub struct Reconciler {
-    config: Config,
-    kube_client: Client,
+    // Target clients for external APIs.
+    zitadel: Option<ZitadelClient>,
     cloudflare: CloudflareClient,
     opnsense: OpnSenseClient,
-    zitadel: Option<ZitadelClient>,
-    metrics: Metrics,
+    // Reflector stores (one per watched resource kind).
+    service_store: Store<Service>,
     ingress_store: Store<IngressRoute>,
     pod_store: Store<Pod>,
-    service_store: Store<Service>,
     policy_store: Store<CoreDnsPolicy>,
     reservation_store: Store<DhcpReservation>,
     dhcp_config_store: Store<DhcpConfig>,
+    /// `None` when Zitadel OIDC management is disabled.
     oidc_store: Option<Store<OidcApplication>>,
+    // Infrastructure.
+    config: Config,
+    kube_client: Client,
+    metrics: Metrics,
     current_state: Mutex<DnsState>,
     wan_ip: Mutex<Option<IpAddr>>,
 }
@@ -54,30 +58,72 @@ impl Reconciler {
         opnsense: OpnSenseClient,
         zitadel: Option<ZitadelClient>,
         metrics: Metrics,
-        ingress_store: Store<IngressRoute>,
-        pod_store: Store<Pod>,
         service_store: Store<Service>,
-        policy_store: Store<CoreDnsPolicy>,
-        reservation_store: Store<DhcpReservation>,
+        pod_store: Store<Pod>,
+        ingress_store: Store<IngressRoute>,
         dhcp_config_store: Store<DhcpConfig>,
+        reservation_store: Store<DhcpReservation>,
+        policy_store: Store<CoreDnsPolicy>,
         oidc_store: Option<Store<OidcApplication>>,
     ) -> Self {
         Self {
-            config,
-            kube_client,
             cloudflare,
             opnsense,
             zitadel,
-            metrics,
             ingress_store,
-            pod_store,
             service_store,
+            pod_store,
+            dhcp_config_store,
             policy_store,
             reservation_store,
-            dhcp_config_store,
             oidc_store,
+            config,
+            kube_client,
+            metrics,
             current_state: Mutex::new(DnsState::new()),
             wan_ip: Mutex::new(None),
+        }
+    }
+
+    /// Lock `current_state`, recovering from a poisoned mutex.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, DnsState> {
+        Self::lock_or_recover(&self.current_state)
+    }
+
+    /// Lock any `Mutex`, recovering transparently from poison.
+    fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record the outcome of a target reconciliation: update the managed-records
+    /// gauge on success, or increment the error counter and warn on failure.
+    ///
+    /// `include_deleted` controls whether `stats.deleted` is counted in the
+    /// managed total (NAT and Dnsmasq count deletions; Unbound and Cloudflare
+    /// do not).
+    fn record_target_result(
+        &self,
+        target: &str,
+        error_source: &str,
+        result: &Result<ReconcileStats, Error>,
+        include_deleted: bool,
+    ) {
+        match result {
+            Ok(stats) => {
+                let total =
+                    stats.created + stats.updated + if include_deleted { stats.deleted } else { 0 };
+                self.metrics
+                    .records_managed
+                    .get_or_create(&target_label(target))
+                    .set(total.into());
+            }
+            Err(e) => {
+                warn!(error = %e, target, "reconciliation failed");
+                self.metrics
+                    .errors_total
+                    .get_or_create(&error_label(error_source))
+                    .inc();
+            }
         }
     }
 
@@ -134,10 +180,7 @@ impl Reconciler {
 
         // Detect WAN IP changes.
         {
-            let mut prev = self
-                .wan_ip
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut prev = Self::lock_or_recover(&self.wan_ip);
             if let Some(old) = *prev
                 && old != wan_ip
             {
@@ -148,11 +191,7 @@ impl Reconciler {
         }
 
         // 5. Diff against cached current state.
-        let current = self
-            .current_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let current = self.lock_state().clone();
         let changes = diff(&desired, &current);
 
         let has_changes =
@@ -168,30 +207,15 @@ impl Reconciler {
             let oidc_desired = build_oidc_desired(&oidc_apps, &ingresses);
 
             let zitadel_url = self.config.zitadel_url.as_deref().unwrap_or_default();
-            match reconcile_oidc(
+            let oidc_result = reconcile_oidc(
                 zitadel,
                 self.kube_client.clone(),
                 &oidc_desired,
                 zitadel_url,
                 self.config.dry_run,
             )
-            .await
-            {
-                Ok(stats) => {
-                    let total = stats.created + stats.updated + stats.deleted;
-                    self.metrics
-                        .records_managed
-                        .get_or_create(&target_label("oidc"))
-                        .set(total.into());
-                }
-                Err(e) => {
-                    warn!(error = %e, "OIDC reconciliation failed");
-                    self.metrics
-                        .errors_total
-                        .get_or_create(&error_label("zitadel"))
-                        .inc();
-                }
-            }
+            .await;
+            self.record_target_result("oidc", "zitadel", &oidc_result, true);
         }
 
         if !has_changes {
@@ -213,49 +237,21 @@ impl Reconciler {
         let mut nat_ok = true;
 
         // -- NAT (external, managed-only entries with WAN expose) --
-        match self
+        let nat_result = self
             .opnsense
             .reconcile_nat(&all_entries, self.config.dry_run)
-            .await
-        {
-            Ok(stats) => {
-                let total = stats.created + stats.updated + stats.deleted;
-                self.metrics
-                    .records_managed
-                    .get_or_create(&target_label("nat"))
-                    .set(total.into());
-            }
-            Err(e) => {
-                warn!(error = %e, "NAT reconciliation failed; skipping Cloudflare");
-                self.metrics
-                    .errors_total
-                    .get_or_create(&error_label("opnsense_nat"))
-                    .inc();
-                nat_ok = false;
-            }
+            .await;
+        if nat_result.is_err() {
+            nat_ok = false;
         }
+        self.record_target_result("nat", "opnsense_nat", &nat_result, true);
 
         // -- Unbound (internal, managed-only entries) --
-        match self
+        let unbound_result = self
             .opnsense
             .reconcile_unbound(&all_entries, self.config.dry_run)
-            .await
-        {
-            Ok(stats) => {
-                let total = stats.created + stats.updated;
-                self.metrics
-                    .records_managed
-                    .get_or_create(&target_label("unbound"))
-                    .set(total.into());
-            }
-            Err(e) => {
-                warn!(error = %e, "Unbound reconciliation failed");
-                self.metrics
-                    .errors_total
-                    .get_or_create(&error_label("opnsense_unbound"))
-                    .inc();
-            }
-        }
+            .await;
+        self.record_target_result("unbound", "opnsense_unbound", &unbound_result, false);
 
         // -- CoreDNS (internal, ALL entries unconditionally) --
         let configmap_data =
@@ -281,26 +277,11 @@ impl Reconciler {
 
         // -- Cloudflare (external, managed-only entries; skip if NAT failed) --
         if nat_ok {
-            match self
+            let cf_result = self
                 .cloudflare
                 .reconcile(&all_entries, wan_ip, self.config.dry_run)
-                .await
-            {
-                Ok(stats) => {
-                    let total = stats.created + stats.updated;
-                    self.metrics
-                        .records_managed
-                        .get_or_create(&target_label("cloudflare"))
-                        .set(total.into());
-                }
-                Err(e) => {
-                    warn!(error = %e, "Cloudflare reconciliation failed");
-                    self.metrics
-                        .errors_total
-                        .get_or_create(&error_label("cloudflare"))
-                        .inc();
-                }
-            }
+                .await;
+            self.record_target_result("cloudflare", "cloudflare", &cf_result, false);
         }
 
         // -- Dnsmasq (DHCP host reservations + range) --
@@ -313,26 +294,11 @@ impl Reconciler {
             })
             .collect();
 
-        match self
+        let dnsmasq_result = self
             .opnsense
             .reconcile_dnsmasq_hosts(&host_entries, self.config.dry_run)
-            .await
-        {
-            Ok(stats) => {
-                let total = stats.created + stats.updated + stats.deleted;
-                self.metrics
-                    .records_managed
-                    .get_or_create(&target_label("dnsmasq"))
-                    .set(total.into());
-            }
-            Err(e) => {
-                warn!(error = %e, "Dnsmasq host reconciliation failed");
-                self.metrics
-                    .errors_total
-                    .get_or_create(&error_label("dnsmasq_hosts"))
-                    .inc();
-            }
-        }
+            .await;
+        self.record_target_result("dnsmasq", "dnsmasq_hosts", &dnsmasq_result, true);
 
         if let Some(dhcp_config) = dhcp_configs.first() {
             let reservation_ips: Vec<String> =
@@ -387,10 +353,7 @@ impl Reconciler {
             .set(all_reservations.len() as i64);
 
         // 7. Update cached current state.
-        *self
-            .current_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = desired;
+        *self.lock_state() = desired;
 
         Ok(())
     }
@@ -476,6 +439,7 @@ async fn reconcile_oidc(
     zitadel_url: &str,
     dry_run: bool,
 ) -> Result<ReconcileStats, Error> {
+    // Accumulate create/update/delete counts across all OIDC apps.
     let mut stats = ReconcileStats::default();
 
     for (name, app) in desired {
@@ -550,8 +514,8 @@ async fn reconcile_oidc(
                         &app.spec,
                         client_id,
                         &project_id,
-                        zitadel_url,
                         dry_run,
+                        zitadel_url,
                     )
                     .await?;
                 } else {
@@ -565,31 +529,30 @@ async fn reconcile_oidc(
                 // App doesn't exist — create it.
                 if dry_run {
                     info!(
-                        app = app.spec.app_name,
                         project = app.spec.project_name,
+                        app = app.spec.app_name,
                         "OIDC [dry-run] would create app"
                     );
                 } else {
                     let (app_id, client_id) = zitadel
                         .create_oidc_app(&project_id, &app.spec.app_name, &redirect_uris)
                         .await?;
-                    info!(
-                        app = app.spec.app_name,
-                        app_id,
-                        client_id,
-                        uris = redirect_uris.len(),
-                        "created OIDC app in Zitadel"
-                    );
-
                     ensure_middleware(
                         &kube,
                         &app.spec,
                         &client_id,
                         &project_id,
-                        zitadel_url,
                         dry_run,
+                        zitadel_url,
                     )
                     .await?;
+                    info!(
+                        app = app.spec.app_name,
+                        project = app.spec.project_name,
+                        ids = %format_args!("{app_id}/{client_id}"),
+                        uris = redirect_uris.len(),
+                        "created OIDC app in Zitadel"
+                    );
                 }
                 stats.created += 1;
             }
@@ -628,14 +591,14 @@ async fn reconcile_oidc(
         }
 
         let labels = mw_obj.metadata.labels.as_ref();
-        let app_name = labels
-            .and_then(|l| l.get("fleet-dns.hr-home.xyz/oidc-app"))
-            .map(String::as_str)
-            .unwrap_or_default();
-        let project_id = labels
-            .and_then(|l| l.get("fleet-dns.hr-home.xyz/project-id"))
-            .map(String::as_str)
-            .unwrap_or_default();
+        let label_val = |key: &str| -> &str {
+            labels
+                .and_then(|l| l.get(key))
+                .map(String::as_str)
+                .unwrap_or_default()
+        };
+        let app_name = label_val("fleet-dns.hr-home.xyz/oidc-app");
+        let project_id = label_val("fleet-dns.hr-home.xyz/project-id");
 
         if dry_run {
             info!(
@@ -666,8 +629,9 @@ async fn reconcile_oidc(
             }
 
             // Delete the orphaned Middleware.
+            let ar = middleware_api_resource();
             let ns_api: Api<kube::core::DynamicObject> =
-                Api::namespaced_with(kube.clone(), mw_ns, &middleware_api_resource());
+                Api::namespaced_with(kube.clone(), mw_ns, &ar);
             ns_api.delete(mw_name, &DeleteParams::default()).await?;
             info!(middleware = %key, "deleted orphaned Traefik Middleware");
         }
@@ -686,8 +650,8 @@ async fn ensure_middleware(
     spec: &crate::crd::OidcApplicationSpec,
     client_id: &str,
     project_id: &str,
-    zitadel_url: &str,
     dry_run: bool,
+    zitadel_url: &str,
 ) -> Result<(), Error> {
     let mw = &spec.middleware;
     let mw_name = &mw.name;
@@ -731,19 +695,23 @@ async fn ensure_middleware(
         serde_json::json!({ "Name": "Authorization" }),
     );
 
-    if !mw.headers.is_empty() {
-        oidc_fields.insert(
-            "Headers".to_owned(),
-            serde_json::json!(
-                mw.headers
-                    .iter()
-                    .map(|h| serde_json::json!({
-                        "Name": &h.name,
-                        "Value": &h.value,
-                    }))
-                    .collect::<Vec<_>>()
-            ),
-        );
+    let mut all_headers: Vec<serde_json::Value> = Vec::new();
+    if mw.default_headers {
+        for (name, value) in [
+            ("X-Oidc-Name", "{{ .claims.name }}"),
+            ("X-Oidc-Email", "{{ .claims.email }}"),
+            ("X-Oidc-Username", "{{ .claims.preferred_username }}"),
+            ("X-Oidc-Subject", "{{ .claims.sub }}"),
+            ("Authorization", "Bearer {{ .accessToken }}"),
+        ] {
+            all_headers.push(serde_json::json!({"Name": name, "Value": value}));
+        }
+    }
+    for h in &mw.headers {
+        all_headers.push(serde_json::json!({"Name": &h.name, "Value": &h.value}));
+    }
+    if !all_headers.is_empty() {
+        oidc_fields.insert("Headers".to_owned(), serde_json::json!(all_headers));
     }
 
     let oidc_auth = serde_json::Value::Object(oidc_fields);

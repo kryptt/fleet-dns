@@ -1,7 +1,6 @@
 use std::time::Duration;
 
-use crate::error::Error;
-use crate::state::parse_duration;
+use crate::{error::Error, state::parse_duration};
 
 /// Application configuration, loaded from environment variables.
 ///
@@ -182,9 +181,11 @@ fn optional_duration(name: &str, default: Duration) -> Result<Duration, Error> {
     }
 }
 
+/// Unit tests for configuration loading.
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::io::Write;
     use std::sync::Mutex;
 
@@ -203,29 +204,31 @@ mod tests {
         }
     }
 
+    /// Minimum set of env vars required for `Config::from_env` to succeed.
+    fn base_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("CLOUDFLARE_API_TOKEN", "cf-token"),
+            ("CLOUDFLARE_ZONE_ID", "zone-123"),
+            ("OPNSENSE_URL", "https://opnsense.local"),
+            ("OPNSENSE_API_KEY", "key"),
+            ("OPNSENSE_API_SECRET", "secret"),
+        ]
+    }
+
     #[test]
     fn from_env_with_all_required_vars() {
-        with_env(
-            &[
-                ("CLOUDFLARE_API_TOKEN", "cf-token"),
-                ("CLOUDFLARE_ZONE_ID", "zone-123"),
-                ("OPNSENSE_URL", "https://opnsense.local"),
-                ("OPNSENSE_API_KEY", "key"),
-                ("OPNSENSE_API_SECRET", "secret"),
-            ],
-            || {
-                let config = Config::from_env().expect("should succeed");
-                assert_eq!(config.cloudflare_api_token, "cf-token");
-                assert_eq!(config.cloudflare_zone_id, "zone-123");
-                assert_eq!(config.opnsense_url, "https://opnsense.local");
-                assert_eq!(config.opnsense_api_key, "key");
-                assert_eq!(config.opnsense_api_secret, "secret");
-                assert_eq!(config.default_reconcile_interval, Duration::from_secs(300));
-                assert_eq!(config.default_dns_ttl, Duration::from_secs(300));
-                assert_eq!(config.wan_interface, "wan");
-                assert!(!config.dry_run);
-            },
-        );
+        with_env(&base_env(), || {
+            let config = Config::from_env().expect("should succeed");
+            assert_eq!(config.cloudflare_api_token, "cf-token");
+            assert_eq!(config.cloudflare_zone_id, "zone-123");
+            assert_eq!(config.opnsense_url, "https://opnsense.local");
+            assert_eq!(config.opnsense_api_key, "key");
+            assert_eq!(config.opnsense_api_secret, "secret");
+            assert_eq!(config.default_reconcile_interval, Duration::from_secs(300));
+            assert_eq!(config.default_dns_ttl, Duration::from_secs(300));
+            assert_eq!(config.wan_interface, "wan");
+            assert!(!config.dry_run);
+        });
     }
 
     #[test]
@@ -244,20 +247,17 @@ mod tests {
             .write_all(b"file-secret  \n")
             .unwrap();
 
-        with_env(
-            &[
-                ("CLOUDFLARE_API_TOKEN", "cf-token"),
-                ("CLOUDFLARE_ZONE_ID", "zone-123"),
-                ("OPNSENSE_URL", "https://opnsense.local"),
-                ("OPNSENSE_API_KEY_FILE", key_path.to_str().unwrap()),
-                ("OPNSENSE_API_SECRET_FILE", secret_path.to_str().unwrap()),
-            ],
-            || {
-                let config = Config::from_env().expect("should succeed");
-                assert_eq!(config.opnsense_api_key, "file-key");
-                assert_eq!(config.opnsense_api_secret, "file-secret");
-            },
-        );
+        let mut vars = base_env();
+        // Replace direct key/secret with _FILE variants.
+        vars.retain(|&(k, _)| k != "OPNSENSE_API_KEY" && k != "OPNSENSE_API_SECRET");
+        vars.push(("OPNSENSE_API_KEY_FILE", key_path.to_str().unwrap()));
+        vars.push(("OPNSENSE_API_SECRET_FILE", secret_path.to_str().unwrap()));
+
+        with_env(&vars, || {
+            let config = Config::from_env().expect("should succeed");
+            assert_eq!(config.opnsense_api_key, "file-key");
+            assert_eq!(config.opnsense_api_secret, "file-secret");
+        });
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -282,57 +282,46 @@ mod tests {
 
     #[test]
     fn optional_duration_parsing() {
-        let default = Duration::from_secs(60);
+        const KEY: &str = "TEST_DUR";
+        let fallback = Duration::from_secs(60);
 
-        // Not set -> default.
+        // Not set -> falls back to the provided default.
         // SAFETY: test-only; serialised via --test-threads=1.
-        unsafe { std::env::remove_var("TEST_DUR") };
-        assert_eq!(optional_duration("TEST_DUR", default).unwrap(), default);
+        unsafe { std::env::remove_var(KEY) };
+        assert_eq!(optional_duration(KEY, fallback).unwrap(), fallback);
 
-        // Valid value.
-        unsafe { std::env::set_var("TEST_DUR", "10m") };
-        assert_eq!(
-            optional_duration("TEST_DUR", default).unwrap(),
-            Duration::from_secs(600)
-        );
-        unsafe { std::env::remove_var("TEST_DUR") };
+        // A valid human-readable duration parses correctly.
+        unsafe { std::env::set_var(KEY, "10m") };
+        let ten_min = optional_duration(KEY, fallback).unwrap();
+        assert_eq!(ten_min, Duration::from_secs(600));
+        unsafe { std::env::remove_var(KEY) };
 
-        // Invalid value -> error.
-        unsafe { std::env::set_var("TEST_DUR", "bogus") };
-        assert!(optional_duration("TEST_DUR", default).is_err());
-        unsafe { std::env::remove_var("TEST_DUR") };
+        // A bogus string produces an error.
+        unsafe { std::env::set_var(KEY, "bogus") };
+        assert!(optional_duration(KEY, fallback).is_err());
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// Parse `Config::from_env` with base env + an extra DRY_RUN value and assert dry_run is set.
+    fn assert_dry_run_enabled(dry_run_value: &str) {
+        let mut vars = base_env();
+        vars.push(("DRY_RUN", dry_run_value));
+        with_env(&vars, || {
+            let config = Config::from_env().unwrap();
+            assert!(
+                config.dry_run,
+                "DRY_RUN={dry_run_value} should enable dry_run"
+            );
+        });
     }
 
     #[test]
-    fn dry_run_parsing() {
-        with_env(
-            &[
-                ("CLOUDFLARE_API_TOKEN", "t"),
-                ("CLOUDFLARE_ZONE_ID", "z"),
-                ("OPNSENSE_URL", "u"),
-                ("OPNSENSE_API_KEY", "k"),
-                ("OPNSENSE_API_SECRET", "s"),
-                ("DRY_RUN", "true"),
-            ],
-            || {
-                let config = Config::from_env().unwrap();
-                assert!(config.dry_run);
-            },
-        );
+    fn dry_run_parsing_true_string() {
+        assert_dry_run_enabled("true");
+    }
 
-        with_env(
-            &[
-                ("CLOUDFLARE_API_TOKEN", "t"),
-                ("CLOUDFLARE_ZONE_ID", "z"),
-                ("OPNSENSE_URL", "u"),
-                ("OPNSENSE_API_KEY", "k"),
-                ("OPNSENSE_API_SECRET", "s"),
-                ("DRY_RUN", "1"),
-            ],
-            || {
-                let config = Config::from_env().unwrap();
-                assert!(config.dry_run);
-            },
-        );
+    #[test]
+    fn dry_run_parsing_numeric_one() {
+        assert_dry_run_enabled("1");
     }
 }

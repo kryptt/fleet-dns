@@ -1,9 +1,7 @@
 use std::sync::LazyLock;
 
-use kube::CustomResource;
+use crate::crd_prelude::*;
 use regex::Regex;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 /// Compiled regex for extracting Host() patterns from Traefik match rules.
 // The pattern is a compile-time constant; `Regex::new` can only fail if this
@@ -55,15 +53,16 @@ pub struct IngressRouteRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IngressRouteMiddlewareRef {
     pub name: String,
-
     #[serde(default)]
     pub namespace: Option<String>,
 }
 
+/// Backend service targeted by an IngressRoute route.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IngressRouteService {
+    /// Kubernetes Service name.
     pub name: String,
-
+    /// Namespace of the Service; defaults to the IngressRoute's namespace.
     #[serde(default)]
     pub namespace: Option<String>,
 }
@@ -104,8 +103,11 @@ mod tests {
 
     #[test]
     fn combined_with_path() {
-        let hosts = extract_hostnames("Host(`foo.hr-home.xyz`) && PathPrefix(`/api`)");
-        assert_eq!(hosts, vec!["foo.hr-home.xyz"]);
+        // PathPrefix should not interfere with Host extraction.
+        assert_eq!(
+            extract_hostnames("Host(`foo.hr-home.xyz`) && PathPrefix(`/api`)"),
+            ["foo.hr-home.xyz"],
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod crd;
+pub mod crd_prelude;
 pub mod discovery;
 pub mod error;
 pub mod metrics;

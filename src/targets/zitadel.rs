@@ -41,10 +41,10 @@ impl ZitadelApp {
     /// Extract redirect URIs from the embedded OIDC config, if present.
     #[must_use]
     pub fn redirect_uris(&self) -> &[String] {
-        self.oidc_config
-            .as_ref()
-            .map(|c| c.redirect_uris.as_slice())
-            .unwrap_or_default()
+        match self.oidc_config {
+            Some(ref cfg) => &cfg.redirect_uris,
+            None => &[],
+        }
     }
 }
 
@@ -106,10 +106,10 @@ fn default_expires_in() -> u64 {
 
 // -- OIDC app request bodies --
 
+/// Common OIDC configuration fields shared between create and update requests.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateOidcAppRequest {
-    name: String,
+struct OidcConfigFields {
     redirect_uris: Vec<String>,
     response_types: Vec<String>,
     grant_types: Vec<String>,
@@ -122,19 +122,29 @@ struct CreateOidcAppRequest {
     id_token_userinfo_assertion: bool,
 }
 
+impl OidcConfigFields {
+    fn new(redirect_uris: Vec<String>) -> Self {
+        Self {
+            redirect_uris,
+            response_types: vec!["OIDC_RESPONSE_TYPE_CODE".to_owned()],
+            grant_types: vec!["OIDC_GRANT_TYPE_AUTHORIZATION_CODE".to_owned()],
+            app_type: "OIDC_APP_TYPE_WEB".to_owned(),
+            auth_method_type: "OIDC_AUTH_METHOD_TYPE_NONE".to_owned(),
+            post_logout_redirect_uris: Vec::new(),
+            dev_mode: false,
+            access_token_type: "OIDC_TOKEN_TYPE_BEARER".to_owned(),
+            id_token_role_assertion: false,
+            id_token_userinfo_assertion: true,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateOidcConfigRequest {
-    redirect_uris: Vec<String>,
-    response_types: Vec<String>,
-    grant_types: Vec<String>,
-    app_type: String,
-    auth_method_type: String,
-    post_logout_redirect_uris: Vec<String>,
-    dev_mode: bool,
-    access_token_type: String,
-    id_token_role_assertion: bool,
-    id_token_userinfo_assertion: bool,
+struct CreateOidcAppRequest {
+    name: String,
+    #[serde(flatten)]
+    config: OidcConfigFields,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,24 +237,15 @@ impl ZitadelClient {
     async fn fetch_token(&self) -> Result<CachedToken, Error> {
         let assertion = self.build_assertion()?;
 
-        let resp = self
+        let req = self
             .client
             .post(format!("{}/oauth/v2/token", self.base_url))
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("scope", "openid urn:zitadel:iam:org:project:id:zitadel:aud"),
                 ("assertion", &assertion),
-            ])
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Zitadel(format!(
-                "token exchange returned {status}: {body}"
-            )));
-        }
+            ]);
+        let resp = self.send_and_check(req, "token exchange").await?;
 
         let token_resp: TokenResponse = resp.json().await?;
 
@@ -283,31 +284,43 @@ impl ZitadelClient {
     // Request helpers
     // -----------------------------------------------------------------------
 
-    /// Build an authenticated POST request.
-    async fn authed_post(&self, path: &str) -> Result<reqwest::RequestBuilder, Error> {
+    /// Build an authenticated request with the given HTTP method.
+    async fn authed_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, Error> {
         let token = self.access_token().await?;
         Ok(self
             .client
-            .post(format!("{}{path}", self.base_url))
+            .request(method, format!("{}{path}", self.base_url))
             .bearer_auth(token))
     }
 
-    /// Build an authenticated PUT request.
-    async fn authed_put(&self, path: &str) -> Result<reqwest::RequestBuilder, Error> {
-        let token = self.access_token().await?;
-        Ok(self
-            .client
-            .put(format!("{}{path}", self.base_url))
-            .bearer_auth(token))
+    /// Send a request, verify the status is successful, and return the response.
+    ///
+    /// All API-facing helpers funnel through this so there is a single
+    /// error-checking site for non-2xx responses.
+    async fn send_and_check(
+        &self,
+        req: reqwest::RequestBuilder,
+        operation: &str,
+    ) -> Result<reqwest::Response, Error> {
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Zitadel(format!(
+                "{operation} returned {status}: {body}"
+            )));
+        }
+        Ok(resp)
     }
 
-    /// Build an authenticated DELETE request.
-    async fn authed_delete(&self, path: &str) -> Result<reqwest::RequestBuilder, Error> {
-        let token = self.access_token().await?;
-        Ok(self
-            .client
-            .delete(format!("{}{path}", self.base_url))
-            .bearer_auth(token))
+    /// Fire-and-forget variant of [`Self::send_and_check`] that discards the
+    /// response body after verifying success.
+    async fn send_checked(&self, req: reqwest::RequestBuilder, op: &str) -> Result<(), Error> {
+        self.send_and_check(req, op).await.map(|_| ())
     }
 
     /// Send an authenticated POST with a JSON body, check status, deserialize.
@@ -315,16 +328,13 @@ impl ZitadelClient {
         &self,
         path: &str,
         body: &B,
-        context: &str,
+        operation: &str,
     ) -> Result<R, Error> {
-        let resp = self.authed_post(path).await?.json(body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Zitadel(format!(
-                "{context} returned {status}: {body}"
-            )));
-        }
+        let req = self
+            .authed_request(reqwest::Method::POST, path)
+            .await?
+            .json(body);
+        let resp = self.send_and_check(req, operation).await?;
         Ok(resp.json().await?)
     }
 
@@ -381,16 +391,7 @@ impl ZitadelClient {
 
         let body = CreateOidcAppRequest {
             name: name.to_owned(),
-            redirect_uris: redirect_uris.to_vec(),
-            response_types: vec!["OIDC_RESPONSE_TYPE_CODE".to_owned()],
-            grant_types: vec!["OIDC_GRANT_TYPE_AUTHORIZATION_CODE".to_owned()],
-            app_type: "OIDC_APP_TYPE_WEB".to_owned(),
-            auth_method_type: "OIDC_AUTH_METHOD_TYPE_NONE".to_owned(),
-            post_logout_redirect_uris: Vec::new(),
-            dev_mode: false,
-            access_token_type: "OIDC_TOKEN_TYPE_BEARER".to_owned(),
-            id_token_role_assertion: false,
-            id_token_userinfo_assertion: true,
+            config: OidcConfigFields::new(redirect_uris.to_vec()),
         };
 
         let resp: CreateOidcAppResponse = self.post_json(&path, &body, "create_oidc_app").await?;
@@ -415,27 +416,13 @@ impl ZitadelClient {
     ) -> Result<(), Error> {
         let path = format!("/management/v1/projects/{project_id}/apps/{app_id}/oidc_config");
 
-        let body = UpdateOidcConfigRequest {
-            redirect_uris: redirect_uris.to_vec(),
-            response_types: vec!["OIDC_RESPONSE_TYPE_CODE".to_owned()],
-            grant_types: vec!["OIDC_GRANT_TYPE_AUTHORIZATION_CODE".to_owned()],
-            app_type: "OIDC_APP_TYPE_WEB".to_owned(),
-            auth_method_type: "OIDC_AUTH_METHOD_TYPE_NONE".to_owned(),
-            post_logout_redirect_uris: Vec::new(),
-            dev_mode: false,
-            access_token_type: "OIDC_TOKEN_TYPE_BEARER".to_owned(),
-            id_token_role_assertion: false,
-            id_token_userinfo_assertion: true,
-        };
+        let body = OidcConfigFields::new(redirect_uris.to_vec());
 
-        let resp = self.authed_put(&path).await?.json(&body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Zitadel(format!(
-                "update_oidc_config returned {status}: {text}"
-            )));
-        }
+        let req = self
+            .authed_request(reqwest::Method::PUT, &path)
+            .await?
+            .json(&body);
+        self.send_checked(req, "update_oidc_config").await?;
 
         info!(project_id, app_id, "updated Zitadel OIDC config");
         Ok(())
@@ -445,14 +432,8 @@ impl ZitadelClient {
     pub async fn delete_app(&self, project_id: &str, app_id: &str) -> Result<(), Error> {
         let path = format!("/management/v1/projects/{project_id}/apps/{app_id}");
 
-        let resp = self.authed_delete(&path).await?.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Zitadel(format!(
-                "delete_app returned {status}: {text}"
-            )));
-        }
+        let req = self.authed_request(reqwest::Method::DELETE, &path).await?;
+        self.send_checked(req, "delete_app").await?;
 
         info!(project_id, app_id, "deleted Zitadel app");
         Ok(())

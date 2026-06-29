@@ -58,6 +58,10 @@ pub fn build_oidc_desired(
 
     // Scan IngressRoutes for hr-home.xyz/oidc labels.
     for ir in ingresses {
+        let ir_name = ir.metadata.name.as_deref().unwrap_or("?");
+        let ir_ns = ir.metadata.namespace.as_deref().unwrap_or("?");
+        let ir_display = format!("{ir_ns}/{ir_name}");
+
         let labels = ir.metadata.labels.as_ref();
         let oidc_ref = labels.and_then(|l| l.get("hr-home.xyz/oidc"));
         let oidc_ref = match oidc_ref {
@@ -68,10 +72,8 @@ pub fn build_oidc_desired(
         let entry = match desired.get_mut(oidc_ref) {
             Some(e) => e,
             None => {
-                let ir_name = ir.metadata.name.as_deref().unwrap_or("?");
-                let ir_ns = ir.metadata.namespace.as_deref().unwrap_or("?");
                 warn!(
-                    ingress = %format!("{ir_ns}/{ir_name}"),
+                    ingress = %ir_display,
                     oidc_ref = oidc_ref,
                     "IngressRoute references non-existent OidcApplication"
                 );
@@ -98,10 +100,8 @@ pub fn build_oidc_desired(
             });
 
             if !has_ref {
-                let ir_name = ir.metadata.name.as_deref().unwrap_or("?");
-                let ir_ns = ir.metadata.namespace.as_deref().unwrap_or("?");
                 warn!(
-                    ingress = %format!("{ir_ns}/{ir_name}"),
+                    ingress = %ir_display,
                     expected_middleware = %format!("{mw_ns}/{mw_name}"),
                     "IngressRoute has hr-home.xyz/oidc label but does not reference the OIDC middleware"
                 );
@@ -121,44 +121,51 @@ mod tests {
     };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
+    /// Shorthand for the middleware ref used by most test ingresses.
+    const OIDC_MW_NS: &str = "ingress";
+
     fn make_oidc_app(name: &str, project: &str, mw_name: &str) -> Arc<OidcApplication> {
+        let spec = OidcApplicationSpec {
+            project_name: project.to_owned(),
+            app_name: name.to_owned(),
+            middleware: OidcMiddlewareSpec {
+                name: mw_name.to_owned(),
+                namespace: OIDC_MW_NS.to_owned(),
+                scopes: vec!["openid".to_owned()],
+                default_headers: true,
+                headers: vec![],
+            },
+            extra_redirect_uris: vec![],
+        };
+        let metadata = ObjectMeta {
+            name: Some(name.to_owned()),
+            namespace: Some(OIDC_MW_NS.to_owned()),
+            ..ObjectMeta::default()
+        };
         Arc::new(OidcApplication {
-            metadata: ObjectMeta {
-                name: Some(name.to_owned()),
-                namespace: Some("ingress".to_owned()),
-                ..Default::default()
-            },
-            spec: OidcApplicationSpec {
-                project_name: project.to_owned(),
-                app_name: name.to_owned(),
-                middleware: OidcMiddlewareSpec {
-                    name: mw_name.to_owned(),
-                    namespace: "ingress".to_owned(),
-                    scopes: vec!["openid".to_owned()],
-                    headers: vec![],
-                },
-                extra_redirect_uris: vec![],
-            },
+            metadata,
+            spec,
             status: None,
         })
     }
 
+    /// Build an `IngressRoute` test fixture.
+    ///
+    /// `oidc_mw` bundles the OIDC label and middleware ref together --
+    /// pass `Some(("crd-name", "mw-name"))` for labeled ingresses, or
+    /// `None` for unlabeled ones.
     fn make_ingress(
         name: &str,
         ns: &str,
         host: &str,
-        oidc_label: Option<&str>,
-        middleware: Option<(&str, &str)>,
+        oidc_mw: Option<(&str, &str)>,
     ) -> Arc<IngressRoute> {
         let mut labels = std::collections::BTreeMap::new();
-        if let Some(oidc) = oidc_label {
-            labels.insert("hr-home.xyz/oidc".to_owned(), oidc.to_owned());
-        }
-
-        let mw_refs = middleware.map(|(mw_name, mw_ns)| {
+        let mw_refs = oidc_mw.map(|(oidc_label, mw_name)| {
+            labels.insert("hr-home.xyz/oidc".to_owned(), oidc_label.to_owned());
             vec![IngressRouteMiddlewareRef {
                 name: mw_name.to_owned(),
-                namespace: Some(mw_ns.to_owned()),
+                namespace: Some(OIDC_MW_NS.to_owned()),
             }]
         });
 
@@ -167,7 +174,7 @@ mod tests {
                 name: Some(name.to_owned()),
                 namespace: Some(ns.to_owned()),
                 labels: Some(labels),
-                ..Default::default()
+                ..ObjectMeta::default()
             },
             spec: IngressRouteSpec {
                 entry_points: None,
@@ -183,6 +190,29 @@ mod tests {
         })
     }
 
+    /// Build desired state and return the entry for `app_key`, asserting
+    /// the redirect-URI count matches `expected_count`.
+    fn assert_redirect_count(
+        apps: &[Arc<OidcApplication>],
+        ingresses: &[Arc<IngressRoute>],
+        app_key: &str,
+        expected_count: usize,
+    ) -> OidcAppDesired {
+        let desired = build_oidc_desired(apps, ingresses);
+        let entry = desired.get(app_key).unwrap().clone();
+        assert_eq!(
+            entry.redirect_uris.len(),
+            expected_count,
+            "expected {expected_count} redirect URIs for {app_key}, got {}",
+            entry.redirect_uris.len(),
+        );
+        entry
+    }
+
+    fn callback_uri(host: &str) -> String {
+        format!("https://{host}/oidc/callback")
+    }
+
     #[test]
     fn builds_redirect_uris_from_ingress_labels() {
         let apps = vec![make_oidc_app("system-oidc", "Home", "system-oidc")];
@@ -191,92 +221,67 @@ mod tests {
                 "mail",
                 "system",
                 "mail.hr-home.xyz",
-                Some("system-oidc"),
-                Some(("system-oidc", "ingress")),
+                Some(("system-oidc", "system-oidc")),
             ),
             make_ingress(
                 "network",
                 "system",
                 "network.hr-home.xyz",
-                Some("system-oidc"),
-                Some(("system-oidc", "ingress")),
+                Some(("system-oidc", "system-oidc")),
             ),
         ];
 
-        let desired = build_oidc_desired(&apps, &ingresses);
-        let app = desired.get("system-oidc").unwrap();
-        assert_eq!(app.redirect_uris.len(), 2);
+        let result = assert_redirect_count(&apps, &ingresses, "system-oidc", 2);
         assert!(
-            app.redirect_uris
-                .contains("https://mail.hr-home.xyz/oidc/callback")
+            result
+                .redirect_uris
+                .contains(&callback_uri("mail.hr-home.xyz"))
         );
         assert!(
-            app.redirect_uris
-                .contains("https://network.hr-home.xyz/oidc/callback")
+            result
+                .redirect_uris
+                .contains(&callback_uri("network.hr-home.xyz"))
         );
     }
 
     #[test]
     fn includes_extra_redirect_uris() {
+        let postman_cb = "https://oauth.pstmn.io/v1/callback".to_owned();
         let mut app = make_oidc_app("test", "Home", "test-oidc");
-        Arc::get_mut(&mut app).unwrap().spec.extra_redirect_uris =
-            vec!["https://oauth.pstmn.io/v1/callback".to_owned()];
+        Arc::get_mut(&mut app).unwrap().spec.extra_redirect_uris = vec![postman_cb.clone()];
 
-        let desired = build_oidc_desired(&[app], &[]);
-        let entry = desired.get("test").unwrap();
-        assert!(
-            entry
-                .redirect_uris
-                .contains("https://oauth.pstmn.io/v1/callback")
-        );
+        let entry = assert_redirect_count(&[app], &[], "test", 1);
+        assert!(entry.redirect_uris.contains(&postman_cb));
     }
 
     #[test]
     fn ignores_ingress_without_oidc_label() {
         let apps = vec![make_oidc_app("system-oidc", "Home", "system-oidc")];
-        let ingresses = vec![
-            make_ingress(
-                "labeled",
-                "system",
-                "a.hr-home.xyz",
-                Some("system-oidc"),
-                Some(("system-oidc", "ingress")),
-            ),
-            make_ingress("unlabeled", "system", "b.hr-home.xyz", None, None),
-        ];
+        let labeled = make_ingress(
+            "labeled",
+            "system",
+            "a.hr-home.xyz",
+            Some(("system-oidc", "system-oidc")),
+        );
+        let unlabeled = make_ingress("unlabeled", "system", "b.hr-home.xyz", None);
 
-        let desired = build_oidc_desired(&apps, &ingresses);
-        let app = desired.get("system-oidc").unwrap();
-        assert_eq!(app.redirect_uris.len(), 1);
+        let result = assert_redirect_count(&apps, &[labeled, unlabeled], "system-oidc", 1);
         assert!(
-            app.redirect_uris
-                .contains("https://a.hr-home.xyz/oidc/callback")
+            result
+                .redirect_uris
+                .contains(&callback_uri("a.hr-home.xyz"))
         );
     }
 
     #[test]
     fn deduplicates_hostnames_from_multiple_routes() {
         let apps = vec![make_oidc_app("test", "Home", "test-oidc")];
-        // Two IngressRoutes with the same hostname
-        let ingresses = vec![
-            make_ingress(
-                "ir1",
-                "ns",
-                "app.hr-home.xyz",
-                Some("test"),
-                Some(("test-oidc", "ingress")),
-            ),
-            make_ingress(
-                "ir2",
-                "ns",
-                "app.hr-home.xyz",
-                Some("test"),
-                Some(("test-oidc", "ingress")),
-            ),
-        ];
+        let same_host = "app.hr-home.xyz";
+        let ingresses: Vec<_> = ["ir1", "ir2"]
+            .iter()
+            .map(|id| make_ingress(id, "ns", same_host, Some(("test", "test-oidc"))))
+            .collect();
 
-        let desired = build_oidc_desired(&apps, &ingresses);
-        let entry = desired.get("test").unwrap();
-        assert_eq!(entry.redirect_uris.len(), 1);
+        assert_redirect_count(&apps, &ingresses, "test", 1);
     }
 }

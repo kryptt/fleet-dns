@@ -16,10 +16,28 @@ use tracing_subscriber::EnvFilter;
 
 use fleet_dns::config::Config;
 use fleet_dns::discovery;
+use fleet_dns::error::Error;
 use fleet_dns::metrics::Metrics;
 use fleet_dns::reconciler::Reconciler;
 use fleet_dns::targets::cloudflare::CloudflareClient;
 use fleet_dns::targets::opnsense::OpnSenseClient;
+
+/// Build Cloudflare and OPNsense clients from the shared configuration.
+fn build_clients(config: &Config) -> Result<(CloudflareClient, OpnSenseClient), Error> {
+    let cloudflare = CloudflareClient::new(
+        &config.cloudflare_api_token,
+        &config.cloudflare_zone_id,
+        &config.cloudflare_cname_target,
+        &config.zones,
+    )?;
+    let opnsense = OpnSenseClient::new(
+        &config.opnsense_url,
+        &config.opnsense_api_key,
+        &config.opnsense_api_secret,
+        &config.zones,
+    )?;
+    Ok((cloudflare, opnsense))
+}
 
 /// Spawn a watch-driver future, treating its completion as fatal.
 ///
@@ -68,14 +86,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(registry);
 
     // 7. Start watchers.
-    let (ingress_store, ingress_handle) = discovery::ingress::start_watcher(kube_client.clone());
-    let (pod_store, pod_handle) = discovery::pods::start_watcher(kube_client.clone());
-    let (service_store, service_handle) = discovery::services::start_watcher(kube_client.clone());
-    let (policy_store, policy_handle) = discovery::policies::start_watcher(kube_client.clone());
-    let (reservation_store, reservation_handle) =
-        discovery::dhcp::start_reservation_watcher(kube_client.clone());
+    let (ingress_store, ingress_handle) = discovery::start_watcher::<
+        fleet_dns::traefik::IngressRoute,
+    >(kube_client.clone(), "ingressroute");
+    let (pod_store, pod_handle) =
+        discovery::start_watcher::<k8s_openapi::api::core::v1::Pod>(kube_client.clone(), "pod");
+    let (service_store, service_handle) = discovery::start_watcher::<
+        k8s_openapi::api::core::v1::Service,
+    >(kube_client.clone(), "service");
+    let (policy_store, policy_handle) = discovery::start_watcher::<fleet_dns::crd::CoreDnsPolicy>(
+        kube_client.clone(),
+        "corednspolicy",
+    );
+    let (reservation_store, reservation_handle) = discovery::start_watcher::<
+        fleet_dns::crd::DhcpReservation,
+    >(kube_client.clone(), "dhcpreservation");
     let (dhcp_config_store, dhcp_config_handle) =
-        discovery::dhcp::start_config_watcher(kube_client.clone());
+        discovery::start_watcher::<fleet_dns::crd::DhcpConfig>(kube_client.clone(), "dhcpconfig");
 
     spawn_critical("ingressroute", ingress_handle);
     spawn_critical("pod", pod_handle);
@@ -85,18 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_critical("dhcpconfig", dhcp_config_handle);
 
     // 8. Build target clients.
-    let cloudflare = CloudflareClient::new(
-        &config.cloudflare_api_token,
-        &config.cloudflare_zone_id,
-        &config.cloudflare_cname_target,
-        &config.zones,
-    )?;
-    let opnsense = OpnSenseClient::new(
-        &config.opnsense_url,
-        &config.opnsense_api_key,
-        &config.opnsense_api_secret,
-        &config.zones,
-    )?;
+    let (cloudflare, opnsense) = build_clients(&config)?;
 
     let reconcile_interval = config.default_reconcile_interval;
     let dry_run = config.dry_run;
@@ -112,7 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("OIDC management enabled (Zitadel at {url})");
             let client =
                 fleet_dns::targets::zitadel::ZitadelClient::new(url, key_id, user_id, private_key)?;
-            let (store, handle) = discovery::oidc::start_watcher(kube_client.clone());
+            let (store, handle) = discovery::start_watcher::<fleet_dns::crd::OidcApplication>(
+                kube_client.clone(),
+                "oidcapplication",
+            );
             spawn_critical("oidcapplication", handle);
             (Some(client), Some(store))
         }
@@ -131,12 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         opnsense,
         zitadel,
         metrics.clone(),
-        ingress_store.clone(),
-        pod_store.clone(),
         service_store.clone(),
-        policy_store.clone(),
-        reservation_store.clone(),
+        pod_store.clone(),
+        ingress_store.clone(),
         dhcp_config_store.clone(),
+        reservation_store.clone(),
+        policy_store.clone(),
         oidc_store,
     ));
 
@@ -304,19 +323,7 @@ async fn metrics_handler(registry: Arc<Registry>, metrics: Metrics) -> impl Into
 async fn run_cleanup(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     info!("running cleanup");
 
-    let opnsense = OpnSenseClient::new(
-        &config.opnsense_url,
-        &config.opnsense_api_key,
-        &config.opnsense_api_secret,
-        &config.zones,
-    )?;
-
-    let cloudflare = CloudflareClient::new(
-        &config.cloudflare_api_token,
-        &config.cloudflare_zone_id,
-        &config.cloudflare_cname_target,
-        &config.zones,
-    )?;
+    let (cloudflare, opnsense) = build_clients(config)?;
 
     // Clean up OPNsense Unbound host overrides.
     let overrides = opnsense.search_host_overrides().await?;

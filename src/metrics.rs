@@ -138,16 +138,21 @@ pub fn error_label(source: &str) -> Labels {
 mod tests {
     use super::*;
 
+    /// Build a fresh registry with all fleet-dns metrics registered.
+    fn test_registry_and_metrics() -> (Registry, Metrics) {
+        let mut registry = Registry::default();
+        let metrics = Metrics::new(&mut registry);
+        (registry, metrics)
+    }
+
     #[test]
     fn metrics_registration_does_not_panic() {
-        let mut registry = Registry::default();
-        let _metrics = Metrics::new(&mut registry);
+        let (_registry, _metrics) = test_registry_and_metrics();
     }
 
     #[test]
     fn metrics_can_be_cloned_and_incremented() {
-        let mut registry = Registry::default();
-        let metrics = Metrics::new(&mut registry);
+        let (_registry, metrics) = test_registry_and_metrics();
         let m2 = metrics.clone();
 
         metrics.reconciliations_total.inc();
@@ -164,13 +169,17 @@ mod tests {
     #[test]
     fn error_label_format() {
         let labels = error_label("opnsense");
-        assert_eq!(labels, vec![("source".to_owned(), "opnsense".to_owned())]);
+        assert_eq!(
+            labels.len(),
+            1,
+            "error_label should produce exactly one pair"
+        );
+        assert_eq!(labels[0], ("source".to_owned(), "opnsense".to_owned()));
     }
 
     #[test]
     fn encode_produces_text() {
-        let mut registry = Registry::default();
-        let metrics = Metrics::new(&mut registry);
+        let (registry, metrics) = test_registry_and_metrics();
         metrics.reconciliations_total.inc();
 
         let mut buf = String::new();

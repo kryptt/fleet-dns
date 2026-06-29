@@ -41,7 +41,7 @@ pub fn render_configmap_data(
     }
 
     // --- Zone server block ---
-    let server_block = render_server_block(entries, policies, zone);
+    let server_block = render_server_block(zone, entries, policies);
     data.insert(SERVER_KEY.to_owned(), server_block);
 
     data
@@ -49,9 +49,9 @@ pub fn render_configmap_data(
 
 /// Build the `hr-home.xyz:53 { ... }` server block.
 fn render_server_block(
+    zone: &str,
     entries: &[DnsEntry],
     policies: &[Arc<CoreDnsPolicy>],
-    zone: &str,
 ) -> String {
     // Group hostnames by lan_ip, sorted for determinism.
     let hosts_block = render_hosts_block(entries);
@@ -178,7 +178,7 @@ mod tests {
             cloudflare_mode: CloudflareMode::Proxied,
             wan_expose: WanExpose::Skip,
             dns_ttl: Duration::from_secs(300),
-            reconcile_interval: Duration::from_secs(300),
+            reconcile_interval: Duration::from_secs(60),
             managed: true,
             source: "test/test".to_owned(),
             unbound_alias_target: None,
@@ -186,12 +186,13 @@ mod tests {
     }
 
     fn policy(key: &str, content: &str, zone: Option<&str>) -> Arc<CoreDnsPolicy> {
+        let meta = ObjectMeta {
+            name: Some(key.to_owned()),
+            namespace: Some("kube-system".to_owned()),
+            ..Default::default()
+        };
         Arc::new(CoreDnsPolicy {
-            metadata: ObjectMeta {
-                name: Some(key.to_owned()),
-                namespace: Some("kube-system".to_owned()),
-                ..Default::default()
-            },
+            metadata: meta,
             spec: CoreDnsPolicySpec {
                 policy_type: "template".to_owned(),
                 zone: zone.map(str::to_owned),
@@ -199,6 +200,11 @@ mod tests {
                 content: content.to_owned(),
             },
         })
+    }
+
+    fn render_server(entries: &[DnsEntry], policies: &[Arc<CoreDnsPolicy>]) -> String {
+        let data = render_configmap_data(entries, policies, &Zones::test().zone);
+        data.get(SERVER_KEY).unwrap().clone()
     }
 
     #[test]
@@ -257,8 +263,7 @@ mod tests {
             entry("bravo.hr-home.xyz", "10.43.0.100"),
         ];
 
-        let data = render_configmap_data(&entries, &[], &Zones::test().zone);
-        let server = data.get(SERVER_KEY).unwrap();
+        let server = render_server(&entries, &[]);
 
         // All three on one line, sorted alphabetically.
         assert!(
@@ -272,8 +277,7 @@ mod tests {
         let template = "template IN CNAME search.hr-home.xyz {\n  answer \"...\"\n}";
         let policies = vec![policy("search.override", template, Some("hr-home.xyz"))];
 
-        let data = render_configmap_data(&entries, &policies, &Zones::test().zone);
-        let server = data.get(SERVER_KEY).unwrap();
+        let server = render_server(&entries, &policies);
 
         let hosts_close = server.find("  }").unwrap();
         let template_pos = server.find("template IN CNAME").unwrap();
@@ -288,8 +292,7 @@ mod tests {
         let template = "template IN AAAA {\n  rcode NXDOMAIN\n}";
         let policies = vec![policy("no-aaaa.override", template, None)];
 
-        let data = render_configmap_data(&[], &policies, &Zones::test().zone);
-        let server = data.get(SERVER_KEY).unwrap();
+        let server = render_server(&[], &policies);
 
         // Hosts block should contain only fallthrough (no IP lines).
         assert!(server.contains("hosts {"));

@@ -1,19 +1,21 @@
-use kube::CustomResource;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use crate::crd_prelude::*;
 
-/// Spec for a CoreDnsPolicy custom resource.
-///
-/// Each CoreDnsPolicy declares a fragment of CoreDNS configuration that
-/// fleet-dns reconciles into a ConfigMap key.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[kube(
-    group = "fleet-dns.hr-home.xyz",
-    version = "v1",
+macro_rules! fleet_crd {
+    ($(#[doc = $doc:expr])* kind = $kind:literal, struct $name:ident { $($body:tt)* }) => {
+        $(#[doc = $doc])*
+        #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+        #[kube(group = "fleet-dns.hr-home.xyz", version = "v1", kind = $kind, namespaced)]
+        pub struct $name { $($body)* }
+    };
+}
+
+fleet_crd! {
+    /// Spec for a CoreDnsPolicy custom resource.
+    ///
+    /// Each CoreDnsPolicy declares a fragment of CoreDNS configuration that
+    /// fleet-dns reconciles into a ConfigMap key.
     kind = "CoreDnsPolicy",
-    namespaced
-)]
-pub struct CoreDnsPolicySpec {
+    struct CoreDnsPolicySpec {
     /// "template" or "hosts"
     pub policy_type: String,
 
@@ -26,19 +28,15 @@ pub struct CoreDnsPolicySpec {
     /// Raw CoreDNS config fragment.
     pub content: String,
 }
+}
 
-/// Spec for a DhcpReservation custom resource.
-///
-/// Each DhcpReservation binds a MAC address to a fixed IP and hostname,
-/// so the DHCP server always hands out a predictable lease.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[kube(
-    group = "fleet-dns.hr-home.xyz",
-    version = "v1",
+fleet_crd! {
+    /// Spec for a DhcpReservation custom resource.
+    ///
+    /// Each DhcpReservation binds a MAC address to a fixed IP and hostname,
+    /// so the DHCP server always hands out a predictable lease.
     kind = "DhcpReservation",
-    namespaced
-)]
-pub struct DhcpReservationSpec {
+    struct DhcpReservationSpec {
     /// Hardware (MAC) address of the client.
     pub mac: String,
 
@@ -51,20 +49,16 @@ pub struct DhcpReservationSpec {
     /// Optional human-readable description.
     pub description: Option<String>,
 }
+}
 
-/// Spec for a DhcpConfig custom resource.
-///
-/// A DhcpConfig describes the parameters for a DHCP scope: the
-/// dynamic range, gateway, DNS servers, lease duration, and any
-/// sub-ranges that are carved out for other uses (e.g. Multus macvlan).
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[kube(
-    group = "fleet-dns.hr-home.xyz",
-    version = "v1",
+fleet_crd! {
+    /// Spec for a DhcpConfig custom resource.
+    ///
+    /// A DhcpConfig describes the parameters for a DHCP scope: the
+    /// dynamic range, gateway, DNS servers, lease duration, and any
+    /// sub-ranges that are carved out for other uses (e.g. Multus macvlan).
     kind = "DhcpConfig",
-    namespaced
-)]
-pub struct DhcpConfigSpec {
+    struct DhcpConfigSpec {
     /// First address in the dynamic DHCP range.
     pub range_start: String,
 
@@ -83,6 +77,7 @@ pub struct DhcpConfigSpec {
     /// Ranges excluded from dynamic allocation (e.g. `["192.168.2.1-192.168.2.79"]`
     /// for addresses reserved by Multus macvlan).
     pub reserved_ranges: Vec<String>,
+}
 }
 
 /// Spec for an OidcApplication custom resource.
@@ -139,9 +134,20 @@ pub struct OidcMiddlewareSpec {
     /// OIDC scopes to request (e.g. `["openid", "profile", "email"]`).
     pub scopes: Vec<String>,
 
-    /// Optional headers forwarding OIDC claims to the upstream service.
+    /// Inject the standard OIDC claim headers (X-Oidc-Name, X-Oidc-Email,
+    /// X-Oidc-Username, X-Oidc-Subject, Authorization). Defaults to true.
+    /// Extra headers in `headers` are appended after the defaults.
+    #[serde(default = "default_true")]
+    pub default_headers: bool,
+
+    /// Extra headers forwarding OIDC claims to the upstream service.
+    /// Appended after default headers when `defaultHeaders` is true.
     #[serde(default)]
     pub headers: Vec<OidcHeaderSpec>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Status of an OidcApplication, updated by fleet-dns after reconciliation.
@@ -194,17 +200,20 @@ mod tests {
         assert_eq!(crd.spec.names.kind, "DhcpConfig");
     }
 
+    fn dhcp_reservation_json(hostname: &str, desc: Option<&str>) -> serde_json::Value {
+        let mut v = serde_json::json!({"mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.2.100", "hostname": hostname});
+        if let Some(d) = desc {
+            v["description"] = serde_json::json!(d);
+        }
+        v
+    }
+
     #[test]
     fn dhcp_reservation_spec_deserializes_all_fields() {
-        let json = serde_json::json!({
-            "mac": "aa:bb:cc:dd:ee:ff",
-            "ip": "192.168.2.100",
-            "hostname": "my-host",
-            "description": "Living room AP"
-        });
-        let spec: DhcpReservationSpec = serde_json::from_value(json).unwrap();
+        let spec: DhcpReservationSpec =
+            serde_json::from_value(dhcp_reservation_json("my-host", Some("Living room AP")))
+                .unwrap();
         assert_eq!(spec.mac, "aa:bb:cc:dd:ee:ff");
-        assert_eq!(spec.ip, "192.168.2.100");
         assert_eq!(spec.hostname, "my-host");
         assert_eq!(spec.description.as_deref(), Some("Living room AP"));
     }
@@ -264,12 +273,8 @@ mod tests {
 
     #[test]
     fn dhcp_reservation_spec_deserializes_without_description() {
-        let json = serde_json::json!({
-            "mac": "aa:bb:cc:dd:ee:ff",
-            "ip": "192.168.2.101",
-            "hostname": "kitchen-sensor"
-        });
-        let spec: DhcpReservationSpec = serde_json::from_value(json).unwrap();
+        let spec: DhcpReservationSpec =
+            serde_json::from_value(dhcp_reservation_json("kitchen-sensor", None)).unwrap();
         assert_eq!(spec.hostname, "kitchen-sensor");
         assert!(spec.description.is_none());
     }

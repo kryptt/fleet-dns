@@ -89,13 +89,15 @@ jobs:
           pattern: digest-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
+      # Re-authenticate for the merge job (separate runner from build matrix).
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.actor }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests

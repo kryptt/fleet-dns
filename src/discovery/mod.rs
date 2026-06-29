@@ -1,15 +1,38 @@
-pub mod dhcp;
-pub mod ingress;
-pub mod oidc;
-pub mod pods;
-pub mod policies;
-pub mod services;
-
+use std::future::Future;
 use std::net::IpAddr;
 
 use futures::{Stream, StreamExt};
+use kube::runtime::WatchStreamExt;
+use kube::runtime::reflector::{self, Store};
+use kube::runtime::watcher;
+use kube::{Api, Client};
 use serde::Deserialize;
 use tracing::{error, warn};
+
+/// Start a reflector that watches all resources of type `T` cluster-wide.
+///
+/// Returns the readable store and a future that drives the watch stream.
+/// The caller is responsible for spawning the future (typically via `tokio::spawn`).
+pub fn start_watcher<T>(
+    client: Client,
+    resource_name: &'static str,
+) -> (Store<T>, impl Future<Output = ()>)
+where
+    T: kube::Resource<DynamicType = ()>
+        + Clone
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static
+        + serde::de::DeserializeOwned,
+{
+    let api: Api<T> = Api::all(client);
+    let (reader, writer) = reflector::store();
+    let config = watcher::Config::default();
+    let stream = watcher(api, config).default_backoff().reflect(writer);
+    let handle = drive_watch(resource_name, stream);
+    (reader, handle)
+}
 
 /// A single entry from the Multus `k8s.v1.cni.cncf.io/network-status` JSON annotation.
 #[derive(Debug, Clone, Deserialize)]
@@ -90,11 +113,22 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// Parse a Multus annotation for the default "lan-macvlan" network.
+    fn multus_lan(annotation: &str) -> Option<IpAddr> {
+        parse_multus_ip(annotation, "lan-macvlan")
+    }
+
+    /// Shorthand to build `Some(IpAddr::V4(...))` for test assertions.
+    fn some_v4(a: u8, b: u8, c: u8, d: u8) -> Option<IpAddr> {
+        Some(IpAddr::V4(Ipv4Addr::new(a, b, c, d)))
+    }
+
     #[test]
     fn valid_annotation_with_cidr() {
-        let annotation = r#"[{"name":"lan-macvlan","ips":["192.168.2.51/24"]}]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 51))));
+        assert_eq!(
+            multus_lan(r#"[{"name":"lan-macvlan","ips":["192.168.2.51/24"]}]"#),
+            some_v4(192, 168, 2, 51),
+        );
     }
 
     #[test]
@@ -103,56 +137,53 @@ mod tests {
             {"name":"default/cbr0","ips":["10.244.1.5/24"]},
             {"name":"default/lan-macvlan","ips":["192.168.2.51/24"]}
         ]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 51))));
+        assert_eq!(multus_lan(annotation), some_v4(192, 168, 2, 51));
     }
 
     #[test]
     fn malformed_json_returns_none() {
-        let ip = parse_multus_ip("not json at all", "lan-macvlan");
-        assert_eq!(ip, None);
+        assert_eq!(multus_lan("not json at all"), None);
     }
 
     #[test]
     fn missing_ips_field_returns_none() {
-        let annotation = r#"[{"name":"lan-macvlan"}]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, None);
+        assert_eq!(multus_lan(r#"[{"name":"lan-macvlan"}]"#), None);
     }
 
     #[test]
     fn network_not_found_returns_none() {
-        let annotation = r#"[{"name":"other-net","ips":["10.0.0.1/16"]}]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, None);
+        assert_eq!(
+            multus_lan(r#"[{"name":"other-net","ips":["10.0.0.1/16"]}]"#),
+            None
+        );
     }
 
     #[test]
     fn ip_without_cidr_prefix() {
-        let annotation = r#"[{"name":"lan-macvlan","ips":["192.168.2.51"]}]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 51))));
+        // Bare IP (no /prefix) should parse identically to one with CIDR.
+        let result = multus_lan(r#"[{"name":"lan-macvlan","ips":["10.0.1.42"]}]"#);
+        assert_eq!(result, some_v4(10, 0, 1, 42));
     }
 
     #[test]
     fn namespaced_network_name_matches() {
-        let annotation = r#"[{"name":"kube-system/lan-macvlan","ips":["192.168.2.99/24"]}]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 99))));
+        // Network names prefixed with a namespace ("kube-system/lan-macvlan")
+        // should match the bare suffix "lan-macvlan".
+        let namespaced = r#"[{"name":"kube-system/lan-macvlan","ips":["192.168.2.99/24"]}]"#;
+        assert_eq!(multus_lan(namespaced), some_v4(192, 168, 2, 99));
     }
 
     #[test]
     fn empty_ips_array_returns_none() {
-        let annotation = r#"[{"name":"lan-macvlan","ips":[]}]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, None);
+        assert_eq!(multus_lan(r#"[{"name":"lan-macvlan","ips":[]}]"#), None);
     }
 
     #[test]
     fn unparseable_ip_returns_none() {
-        let annotation = r#"[{"name":"lan-macvlan","ips":["not-an-ip"]}]"#;
-        let ip = parse_multus_ip(annotation, "lan-macvlan");
-        assert_eq!(ip, None);
+        assert_eq!(
+            multus_lan(r#"[{"name":"lan-macvlan","ips":["not-an-ip"]}]"#),
+            None
+        );
     }
 
     #[tokio::test]

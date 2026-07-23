@@ -3,7 +3,7 @@ use std::{net::IpAddr, time::Duration};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::error::Error;
 use crate::state::{CloudflareMode, DnsEntry};
@@ -65,6 +65,10 @@ struct DnsRecord {
     #[allow(dead_code)]
     #[serde(rename = "type")]
     record_type: String,
+    /// Cloudflare record comment. A non-empty comment marks the record as
+    /// human-managed (e.g. mail-infra MX targets) — orphan deletion skips it.
+    #[serde(default)]
+    comment: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +267,13 @@ impl CloudflareClient {
             if let Some(skip) = extra_skip
                 && record.name == skip
             {
+                continue;
+            }
+            if record.comment.as_deref().is_some_and(|c| !c.is_empty()) {
+                debug!(
+                    hostname = %record.name,
+                    "skipping commented (human-managed) Cloudflare {record_type} record"
+                );
                 continue;
             }
             if dry_run {
@@ -504,6 +515,20 @@ mod tests {
         assert_eq!(record.record_type, "CNAME");
         assert_eq!(record.content, "hr-main.hr-home.xyz");
         assert!(record.proxied);
+        assert_eq!(record.comment, None);
+    }
+
+    #[test]
+    fn dns_record_deserializes_comment_as_human_managed_marker() {
+        let record = parse_dns_record(
+            r#"{"id":"ghi789","name":"mx.hr-home.xyz","content":"1.2.3.4","ttl":300,"proxied":false,"type":"A","comment":"manual: Stalwart MX host"}"#,
+        );
+        assert_eq!(record.comment.as_deref(), Some("manual: Stalwart MX host"));
+        // The empty-string case must NOT count as human-managed.
+        let blank = parse_dns_record(
+            r#"{"id":"jkl012","name":"x.hr-home.xyz","content":"1.2.3.4","ttl":300,"proxied":false,"type":"A","comment":""}"#,
+        );
+        assert!(blank.comment.as_deref().is_none_or(|c| c.is_empty()));
     }
 
     #[test]

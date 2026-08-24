@@ -133,6 +133,7 @@ mod tests {
                 namespace: OIDC_MW_NS.to_owned(),
                 scopes: vec!["openid".to_owned()],
                 default_headers: true,
+                authorization_header: true,
                 headers: vec![],
             },
             extra_redirect_uris: vec![],

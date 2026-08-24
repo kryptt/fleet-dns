@@ -690,10 +690,12 @@ async fn ensure_middleware(
         }),
     );
     oidc_fields.insert("Scopes".to_owned(), serde_json::json!(&mw.scopes));
-    oidc_fields.insert(
-        "AuthorizationHeader".to_owned(),
-        serde_json::json!({ "Name": "Authorization" }),
-    );
+    if mw.authorization_header {
+        oidc_fields.insert(
+            "AuthorizationHeader".to_owned(),
+            serde_json::json!({ "Name": "Authorization" }),
+        );
+    }
 
     let mut all_headers: Vec<serde_json::Value> = Vec::new();
     if mw.default_headers {

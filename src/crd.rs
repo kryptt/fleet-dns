@@ -144,6 +144,14 @@ pub struct OidcMiddlewareSpec {
     /// Appended after default headers when `defaultHeaders` is true.
     #[serde(default)]
     pub headers: Vec<OidcHeaderSpec>,
+
+    /// Let the plugin accept an inbound `Authorization: Bearer <token>` as an
+    /// externally minted OIDC access token. Defaults to true. Set false for
+    /// upstreams whose own SPA sends `Authorization` on API calls (e.g. its own
+    /// API key) — otherwise the plugin tries to validate that value as a
+    /// Zitadel token and answers 401 before the request reaches the upstream.
+    #[serde(default = "default_true")]
+    pub authorization_header: bool,
 }
 
 fn default_true() -> bool {
@@ -245,6 +253,10 @@ mod tests {
         assert_eq!(spec.app_name, "system-oidc");
         assert_eq!(spec.middleware.name, "system-oidc");
         assert_eq!(spec.middleware.namespace, "ingress");
+        assert!(
+            spec.middleware.authorization_header,
+            "authorizationHeader defaults to true"
+        );
         assert_eq!(spec.middleware.scopes, vec!["openid", "profile", "email"]);
         assert_eq!(
             spec.extra_redirect_uris,

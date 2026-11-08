@@ -48,6 +48,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Gate: run the image's test stage on this platform before anything is
+      # pushed. Without this a tag could ship a binary whose tests ran
+      # nowhere — ci.yml covers branches and PRs, but a tag can point at any
+      # commit. Shares the build cache with the release step below, so the
+      # builder stage is compiled once per platform.
+      - name: Test in image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          target: test
+          push: false
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6

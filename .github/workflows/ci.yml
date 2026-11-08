@@ -50,6 +50,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # Config in .jscpd.json: fails on any clone of 6+ lines / 30+ tokens.
+      # Config in .jscpd.json: fails on any clone of 6+ lines / 25+ tokens.
       - name: jscpd
         run: npx --yes jscpd@4 .

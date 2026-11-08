@@ -1,5 +1,5 @@
 {
-  "minTokens": 30,
+  "minTokens": 25,
   "minLines": 6,
   "threshold": 0,
   "gitignore": true,

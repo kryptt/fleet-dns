@@ -456,15 +456,21 @@ hr-home.xyz:53 {
         orgs
     }
 
-    /// A CoreDnsPolicy carrying an explicit `spec.org`, and optionally an
-    /// explicit `spec.zone` that should take precedence over it.
-    fn org_policy(key: &str, content: &str, zone: Option<&str>, org: &str) -> Arc<CoreDnsPolicy> {
+    /// Render the two-organization ConfigMap from a single CoreDnsPolicy that
+    /// carries `spec.org`, and optionally an explicit `spec.zone` that should
+    /// take precedence over it.
+    fn render_with_org_policy(
+        key: &str,
+        content: &str,
+        zone: Option<&str>,
+        org: &str,
+    ) -> BTreeMap<String, String> {
         let mut p = policy(key, content, zone);
         Arc::get_mut(&mut p)
             .expect("freshly built Arc is unique")
             .spec
             .org = Some(org.to_owned());
-        p
+        render_configmap_data(&[], &[p], &two_orgs())
     }
 
     /// A DNS entry owned by a named organization.
@@ -525,14 +531,12 @@ hr-home.xyz:53 {
 
     #[test]
     fn policy_org_selects_the_zone_block() {
-        let p = org_policy(
+        let data = render_with_org_policy(
             "quota-fix.override",
             "template IN A x {\n  answer \"y\"\n}",
             None,
             "quota-fitness",
         );
-
-        let data = render_configmap_data(&[], &[p], &two_orgs());
 
         // The policy pulled the quota block into existence and landed inside
         // it, rather than becoming a standalone key.
@@ -543,14 +547,12 @@ hr-home.xyz:53 {
 
     #[test]
     fn explicit_zone_wins_over_org_on_a_policy() {
-        let p = org_policy(
+        let data = render_with_org_policy(
             "pinned.override",
             "template IN A z {\n  answer \"w\"\n}",
             Some("hr-home.xyz"),
             "quota-fitness",
         );
-
-        let data = render_configmap_data(&[], &[p], &two_orgs());
 
         assert!(data["hr-home-xyz.server"].contains("template IN A z"));
         assert!(!data.contains_key("quota-fitness.server"));
@@ -559,9 +561,7 @@ hr-home.xyz:53 {
     #[test]
     fn policy_naming_an_unknown_organization_becomes_a_standalone_key() {
         let content = "template IN AAAA {\n  rcode NXDOMAIN\n}";
-        let p = org_policy("orphan.override", content, None, "gone");
-
-        let data = render_configmap_data(&[], &[p], &two_orgs());
+        let data = render_with_org_policy("orphan.override", content, None, "gone");
 
         assert_eq!(
             data.get("orphan.override").map(String::as_str),

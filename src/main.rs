@@ -84,7 +84,9 @@ async fn discover_orgs(
             }
         };
 
-        let Some(zone) = metadata_zone.or(org.primary_domain.clone()) else {
+        let Some(zone) =
+            fleet_dns::config::org_zone(metadata_zone.as_deref(), org.primary_domain.as_deref())
+        else {
             warn!(
                 org = %org.name,
                 "organization has neither a dnsZone metadata value nor a primary domain; skipping"

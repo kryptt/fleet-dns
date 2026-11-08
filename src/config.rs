@@ -104,6 +104,22 @@ impl Org {
     }
 }
 
+/// Pick an organization's DNS zone from its Zitadel facts.
+///
+/// The `dnsZone` org-metadata value wins, because a Zitadel organization's
+/// primary domain is not always a zone fleet-dns should manage: a freshly
+/// created organization gets `{name}.zitadel.{instance}`, which is an identity
+/// hostname, not a DNS zone. Returns `None` when neither is usable, so the
+/// caller skips the organization instead of inventing a zone.
+#[must_use]
+pub fn org_zone(metadata_dns_zone: Option<&str>, primary_domain: Option<&str>) -> Option<String> {
+    metadata_dns_zone
+        .or(primary_domain)
+        .map(str::trim)
+        .filter(|z| !z.is_empty())
+        .map(str::to_owned)
+}
+
 /// The set of organizations fleet-dns manages, with one marked default.
 ///
 /// The default organization is always present and always built from the
@@ -439,6 +455,59 @@ mod tests {
 
         let err = Config::from_env().unwrap_err();
         assert!(err.to_string().contains("CLOUDFLARE_API_TOKEN"));
+    }
+
+    #[test]
+    fn org_zone_prefers_metadata_over_primary_domain() {
+        // A new Zitadel org's primary domain is an identity hostname, so the
+        // dnsZone metadata value is what makes it a usable DNS zone.
+        assert_eq!(
+            org_zone(
+                Some("quota.fitness"),
+                Some("quota-fitness.zitadel.hr-home.xyz")
+            )
+            .as_deref(),
+            Some("quota.fitness")
+        );
+    }
+
+    #[test]
+    fn org_zone_falls_back_to_primary_domain() {
+        assert_eq!(
+            org_zone(None, Some("fida.finance")).as_deref(),
+            Some("fida.finance")
+        );
+    }
+
+    #[test]
+    fn org_zone_rejects_missing_and_blank_values() {
+        assert_eq!(org_zone(None, None), None);
+        assert_eq!(org_zone(Some("   "), None), None);
+        // A blank metadata value falls through to nothing rather than
+        // producing an organization with an empty zone, which would match
+        // every hostname.
+        assert_eq!(org_zone(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn default_organization_is_unaffected_by_discovery() {
+        let mut orgs = Orgs::single(Org::new("hr-home", "hr-home.xyz"));
+        // Discovery tries to redefine the default with a different zone.
+        orgs.extend([Org::new("hr-home", "bogus.example")]);
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs.default_org().zone, "hr-home.xyz");
+    }
+
+    #[test]
+    fn iter_yields_the_default_organization_first() {
+        let mut orgs = Orgs::single(Org::new("hr-home", "hr-home.xyz"));
+        orgs.extend([
+            Org::new("aaa-first-alphabetically", "aaa.example"),
+            Org::new("quota-fitness", "quota.fitness"),
+        ]);
+        let names: Vec<&str> = orgs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names[0], "hr-home");
+        assert_eq!(names.len(), 3);
     }
 
     #[test]

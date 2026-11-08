@@ -91,10 +91,11 @@ struct OrgMetadata {
     value: Option<String>,
 }
 
+/// `POST /v2/organizations/{id}/metadata/search` response.
 #[derive(Debug, Deserialize)]
 struct OrgMetadataSearchResponse {
     #[serde(default)]
-    result: Vec<OrgMetadata>,
+    metadata: Vec<OrgMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,14 +416,16 @@ impl ZitadelClient {
     // Organization operations
     // -----------------------------------------------------------------------
 
-    /// List every organization in the instance.
+    /// List every organization the service account can see.
     ///
-    /// Requires instance-level org read permission. Callers treat a failure as
-    /// "only the default organization exists" rather than fatal.
+    /// Requires instance-level organization read permission. A service account
+    /// holding only project-scoped grants gets `403 No matching permissions
+    /// found`, so callers treat any failure as "only the default organization
+    /// exists" rather than fatal.
     pub async fn list_orgs(&self) -> Result<Vec<ZitadelOrg>, Error> {
         let resp: OrgSearchResponse = self
             .post_json(
-                "/admin/v1/orgs/_search",
+                "/v2/organizations/_search",
                 &serde_json::json!({}),
                 "list_orgs",
                 None,
@@ -438,17 +441,13 @@ impl ZitadelClient {
     /// Used for the `dnsZone` key, which lets an organization declare a DNS
     /// zone that differs from its Zitadel primary domain.
     pub async fn org_metadata(&self, org_id: &str, key: &str) -> Result<Option<String>, Error> {
+        let path = format!("/v2/organizations/{org_id}/metadata/search");
         let resp: OrgMetadataSearchResponse = self
-            .post_json(
-                "/management/v1/orgs/me/metadata/_search",
-                &serde_json::json!({}),
-                "org_metadata",
-                Some(org_id),
-            )
+            .post_json(&path, &serde_json::json!({}), "org_metadata", None)
             .await?;
 
         let Some(raw) = resp
-            .result
+            .metadata
             .into_iter()
             .find(|m| m.key == key)
             .and_then(|m| m.value)

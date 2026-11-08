@@ -336,4 +336,55 @@ mod tests {
         let pos_beta = server.find("beta.hr-home.xyz").unwrap();
         assert!(pos_alpha < pos_beta);
     }
+    // -----------------------------------------------------------------------
+    // Golden snapshot — the exact ConfigMap that lands in kube-system.
+    //
+    // No org is set anywhere in this fixture. Org support must leave this
+    // output byte-identical, including the `hr-home-xyz.server` key name.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn golden_configmap_without_orgs() {
+        let entries = vec![
+            entry("ha.hr-home.xyz", "10.43.0.100"),
+            entry("plex.hr-home.xyz", "10.43.0.100"),
+            entry("plex-direct.hr-home.xyz", "192.168.2.40"),
+            entry("kitchen-sensor.hr-home.xyz", "192.168.2.100"),
+        ];
+        let policies = vec![
+            policy(
+                "no-aaaa.override",
+                "template IN AAAA {\n  rcode NXDOMAIN\n}",
+                None,
+            ),
+            policy(
+                "search-fix.override",
+                "template IN A search.hr-home.xyz {\n  answer \"search 60 IN CNAME searxng\"\n}",
+                Some("hr-home.xyz"),
+            ),
+        ];
+
+        let data = render_configmap_data(&entries, &policies, &Zones::test().zone);
+
+        let keys: Vec<&str> = data.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["hr-home-xyz.server", "no-aaaa.override"]);
+
+        assert_eq!(
+            data.get("hr-home-xyz.server").unwrap(),
+            "\
+hr-home.xyz:53 {
+  errors
+  hosts {
+    10.43.0.100 ha.hr-home.xyz plex.hr-home.xyz
+    192.168.2.100 kitchen-sensor.hr-home.xyz
+    192.168.2.40 plex-direct.hr-home.xyz
+    fallthrough
+  }
+  template IN A search.hr-home.xyz {
+    answer \"search 60 IN CNAME searxng\"
+  }
+  forward . /etc/resolv.conf
+  cache 30
+}"
+        );
+    }
 }

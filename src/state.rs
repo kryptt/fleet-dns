@@ -1424,4 +1424,113 @@ mod tests {
         assert!(state.is_empty());
         assert!(returned.is_empty());
     }
+    // -----------------------------------------------------------------------
+    // Golden snapshot — behavioural baseline for the multi-org refactor.
+    //
+    // This locks the exact desired-state output for a representative fixture
+    // that uses NO org annotations anywhere. It must keep producing identical
+    // output after org support lands: that is the proof the change cannot
+    // alter what fleet-dns writes to the cluster or to OPNsense/Cloudflare.
+    // -----------------------------------------------------------------------
+
+    /// Render a `DnsState` as a stable, sorted, human-diffable snapshot.
+    fn snapshot(state: &DnsState) -> String {
+        let mut names: Vec<&String> = state.keys().collect();
+        names.sort();
+        let mut out = String::new();
+        for name in names {
+            let e = &state[name];
+            out.push_str(&format!(
+                "{host} lan={lan} mv={mv:?} cf={cf:?} wan={wan:?} ttl={ttl} iv={iv} managed={m} alias={alias:?} src={src}\n",
+                host = e.hostname,
+                lan = e.lan_ip,
+                mv = e.macvlan_ip.map(|i| i.to_string()),
+                cf = e.cloudflare_mode,
+                wan = e.wan_expose,
+                ttl = e.dns_ttl.as_secs(),
+                iv = e.reconcile_interval.as_secs(),
+                m = e.managed,
+                alias = e.unbound_alias_target,
+                src = e.source,
+            ));
+        }
+        out
+    }
+
+    /// The fixture every golden assertion shares: one plain service, one
+    /// macvlan service with WAN exposure, one Cloudflare-skipped service,
+    /// and a DHCP reservation merged in.
+    fn golden_state() -> DnsState {
+        let plex_ir = make_ingress_route(
+            "media",
+            "plex",
+            "Host(`plex.hr-home.xyz`)",
+            "plex",
+            labels(&[
+                ("hr-home.xyz/dns", "true"),
+                ("hr-home.xyz/wan-expose", "true"),
+            ]),
+        );
+        let plex_svc = make_service(
+            "media",
+            "plex",
+            labels(&[("app", "plex")]),
+            vec![(32400, "TCP")],
+        );
+        let plex_pod = make_pod(
+            "media",
+            "plex-pod",
+            labels(&[("app", "plex")]),
+            Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.40/24"]}]"#),
+        );
+
+        let wiki_ir = make_ingress_route(
+            "fida",
+            "wiki",
+            "Host(`wiki.hr-home.xyz`)",
+            "wiki",
+            labels(&[
+                ("hr-home.xyz/dns", "true"),
+                ("hr-home.xyz/cloudflare", "skip"),
+            ]),
+        );
+
+        let internal_ir = make_ingress_route(
+            "ai",
+            "internal",
+            "Host(`internal.hr-home.xyz`)",
+            "internal",
+            labels(&[]),
+        );
+
+        let mut state = build_desired_state(
+            &[plex_ir, wiki_ir, internal_ir],
+            &[plex_pod],
+            &[plex_svc],
+            traefik_ip(),
+            &zones(),
+        );
+
+        let reservations = vec![make_dhcp_reservation(
+            "kitchen-sensor",
+            "aa:bb:cc:dd:ee:ff",
+            "192.168.2.100",
+        )];
+        let _ = merge_dhcp_reservations(&mut state, &reservations);
+
+        state
+    }
+
+    #[test]
+    fn golden_desired_state_without_orgs() {
+        let expected = "\
+ha.hr-home.xyz lan=10.43.0.100 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed=true alias=None src=synthetic/unbound-anchor
+internal.hr-home.xyz lan=10.43.0.100 mv=None cf=Proxied wan=Skip ttl=300 iv=300 managed=false alias=Some(\"ha.hr-home.xyz\") src=ai/internal
+kitchen-sensor.hr-home.xyz lan=192.168.2.100 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed=true alias=None src=dhcp/kitchen-sensor
+plex-direct.hr-home.xyz lan=192.168.2.40 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed=true alias=None src=media/plex/direct
+plex.hr-home.xyz lan=10.43.0.100 mv=Some(\"192.168.2.40\") cf=Proxied wan=Expose { ports: [PortForward { port: 32400, protocol: Tcp }] } ttl=300 iv=300 managed=true alias=Some(\"ha.hr-home.xyz\") src=media/plex
+wiki.hr-home.xyz lan=10.43.0.100 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed=true alias=Some(\"ha.hr-home.xyz\") src=fida/wiki
+";
+        assert_eq!(snapshot(&golden_state()), expected);
+    }
 }

@@ -1,1 +1,8 @@
-{"minTokens": 15, "minLines": 3, "threshold": 0, "gitignore": true, "reporters": ["console"], "exitCode": 1}
+{
+  "minTokens": 30,
+  "minLines": 6,
+  "threshold": 0,
+  "gitignore": true,
+  "reporters": ["console"],
+  "exitCode": 1
+}

@@ -1,0 +1,55 @@
+name: ci
+
+# Runs the same gates as .githooks/pre-commit and .githooks/pre-push, so a
+# clone without core.hooksPath set — or a `git commit --no-verify` — cannot
+# land unformatted, lint-failing, untested, or duplicated code on main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Mirrors the Dockerfile test stage, which runs serially. Env-mutating
+      # config tests serialise on a Mutex, so both orderings get exercised:
+      # single-threaded here and in the image, parallel in the pre-push hook.
+      - name: cargo test
+        run: cargo test --all-features -- --test-threads=1
+
+  duplicates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Config in .jscpd.json: fails on any clone of 6+ lines / 30+ tokens.
+      - name: jscpd
+        run: npx --yes jscpd@4 .

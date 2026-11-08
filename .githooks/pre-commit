@@ -6,3 +6,13 @@ cargo fmt --all -- --check
 
 echo "pre-commit: cargo clippy"
 cargo clippy --all-targets --all-features -- -D warnings
+
+# Duplicate-code gate. Skipped rather than failed when npx is unavailable:
+# CI runs it unconditionally, so a missing local Node cannot smuggle a clone
+# past review.
+if command -v npx >/dev/null 2>&1; then
+  echo "pre-commit: jscpd"
+  npx --yes jscpd@4 .
+else
+  echo "pre-commit: jscpd skipped (npx not found)"
+fi

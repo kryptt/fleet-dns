@@ -456,6 +456,17 @@ hr-home.xyz:53 {
         orgs
     }
 
+    /// A CoreDnsPolicy carrying an explicit `spec.org`, and optionally an
+    /// explicit `spec.zone` that should take precedence over it.
+    fn org_policy(key: &str, content: &str, zone: Option<&str>, org: &str) -> Arc<CoreDnsPolicy> {
+        let mut p = policy(key, content, zone);
+        Arc::get_mut(&mut p)
+            .expect("freshly built Arc is unique")
+            .spec
+            .org = Some(org.to_owned());
+        p
+    }
+
     /// A DNS entry owned by a named organization.
     fn org_entry(hostname: &str, ip: &str, org: &str) -> DnsEntry {
         let mut e = entry(hostname, ip);
@@ -514,12 +525,12 @@ hr-home.xyz:53 {
 
     #[test]
     fn policy_org_selects_the_zone_block() {
-        let mut p = policy(
+        let p = org_policy(
             "quota-fix.override",
             "template IN A x {\n  answer \"y\"\n}",
             None,
+            "quota-fitness",
         );
-        Arc::get_mut(&mut p).unwrap().spec.org = Some("quota-fitness".to_owned());
 
         let data = render_configmap_data(&[], &[p], &two_orgs());
 
@@ -532,12 +543,12 @@ hr-home.xyz:53 {
 
     #[test]
     fn explicit_zone_wins_over_org_on_a_policy() {
-        let mut p = policy(
+        let p = org_policy(
             "pinned.override",
             "template IN A z {\n  answer \"w\"\n}",
             Some("hr-home.xyz"),
+            "quota-fitness",
         );
-        Arc::get_mut(&mut p).unwrap().spec.org = Some("quota-fitness".to_owned());
 
         let data = render_configmap_data(&[], &[p], &two_orgs());
 
@@ -548,8 +559,7 @@ hr-home.xyz:53 {
     #[test]
     fn policy_naming_an_unknown_organization_becomes_a_standalone_key() {
         let content = "template IN AAAA {\n  rcode NXDOMAIN\n}";
-        let mut p = policy("orphan.override", content, None);
-        Arc::get_mut(&mut p).unwrap().spec.org = Some("gone".to_owned());
+        let p = org_policy("orphan.override", content, None, "gone");
 
         let data = render_configmap_data(&[], &[p], &two_orgs());
 

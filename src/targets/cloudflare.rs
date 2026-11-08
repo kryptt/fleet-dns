@@ -7,7 +7,7 @@ use tracing::{debug, info};
 
 use crate::error::Error;
 use crate::state::{CloudflareMode, DnsEntry};
-use crate::{ReconcileStats, Zones};
+use crate::{Org, ReconcileStats};
 
 /// Minimum TTL Cloudflare accepts for non-proxied records.
 const MIN_TTL: u32 = 60;
@@ -15,16 +15,21 @@ const MIN_TTL: u32 = 60;
 /// Cloudflare uses TTL = 1 to mean "automatic" for proxied records.
 const AUTO_TTL: u32 = 1;
 
+/// One organization's Cloudflare zone: the zone ID to write into and the
+/// organization that decides which record names belong to it.
+#[derive(Debug, Clone, Copy)]
+struct ZoneScope<'a> {
+    org: &'a Org,
+    zone_id: &'a str,
+}
+
 /// Async client wrapping Cloudflare API v4 for DNS record CRUD.
 ///
 /// Uses a CNAME model: one A record for `cname_target` holds the WAN IP,
 /// all service hostnames are CNAMEs pointing to it.
 pub struct CloudflareClient {
     client: Client,
-    zone_id: String,
     base_url: String,
-    cname_target: String,
-    zones: Zones,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,15 +112,9 @@ fn format_errors(errors: &[CloudflareError]) -> String {
 impl CloudflareClient {
     /// Create a new client authenticated with a Cloudflare API token.
     ///
-    /// `cname_target` is the hostname that holds the A record (e.g.,
-    /// `hr-main.hr-home.xyz`). All service hostnames become CNAMEs
-    /// pointing to it.
-    pub fn new(
-        token: &str,
-        zone_id: &str,
-        cname_target: &str,
-        zones: &Zones,
-    ) -> Result<Self, Error> {
+    /// Zone, CNAME target and prune scope are per-organization and arrive with
+    /// each [`Self::reconcile`] call, so one client serves every organization.
+    pub fn new(token: &str) -> Result<Self, Error> {
         let mut headers = HeaderMap::new();
         let mut auth_value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| {
             Error::Cloudflare(format!("API token is not a valid header value: {e}"))
@@ -128,10 +127,7 @@ impl CloudflareClient {
 
         Ok(Self {
             client,
-            zone_id: zone_id.to_owned(),
             base_url: "https://api.cloudflare.com/client/v4".to_owned(),
-            cname_target: cname_target.to_owned(),
-            zones: zones.clone(),
         })
     }
 
@@ -154,11 +150,38 @@ impl CloudflareClient {
         }
     }
 
-    /// List all records of a given type in the zone.
-    async fn list_records_by_type(&self, record_type: &str) -> Result<Vec<DnsRecord>, Error> {
+    /// Look up a Cloudflare zone ID by zone name.
+    ///
+    /// Returns `Ok(None)` when the API token can see no zone with that name,
+    /// which is the normal case for an organization whose DNS is not on
+    /// Cloudflare.
+    pub async fn find_zone_id(&self, zone_name: &str) -> Result<Option<String>, Error> {
+        #[derive(Debug, Default, Deserialize)]
+        struct Zone {
+            id: String,
+            name: String,
+        }
+
+        let url = format!("{}/zones?name={zone_name}", self.base_url);
+        let zones: Vec<Zone> = self
+            .send_cf(self.client.get(&url), &format!("find_zone({zone_name})"))
+            .await?;
+
+        Ok(zones
+            .into_iter()
+            .find(|z| z.name == zone_name)
+            .map(|z| z.id))
+    }
+
+    /// List all records of a given type in a zone.
+    async fn list_records_by_type(
+        &self,
+        zone_id: &str,
+        record_type: &str,
+    ) -> Result<Vec<DnsRecord>, Error> {
         let url = format!(
-            "{}/zones/{}/dns_records?type={}&per_page=500",
-            self.base_url, self.zone_id, record_type
+            "{}/zones/{zone_id}/dns_records?type={}&per_page=500",
+            self.base_url, record_type
         );
         self.send_cf(
             self.client.get(&url),
@@ -168,27 +191,25 @@ impl CloudflareClient {
     }
 
     /// Build the URL for a specific DNS record (update / delete).
-    fn record_url(&self, record_id: &str) -> String {
-        format!(
-            "{}/zones/{}/dns_records/{record_id}",
-            self.base_url, self.zone_id
-        )
+    fn record_url(&self, zone_id: &str, record_id: &str) -> String {
+        format!("{}/zones/{zone_id}/dns_records/{record_id}", self.base_url)
     }
 
     /// Create or update a DNS record. When `record_id` is `Some`, issues a PUT
     /// (update); otherwise issues a POST (create).
     async fn write_record(
         &self,
+        zone_id: &str,
         record_id: Option<&str>,
         body: &CreateDnsRecord,
     ) -> Result<(), Error> {
         let (req, verb) = match record_id {
             Some(id) => (
-                self.client.put(self.record_url(id)).json(body),
+                self.client.put(self.record_url(zone_id, id)).json(body),
                 "update_record",
             ),
             None => {
-                let url = format!("{}/zones/{}/dns_records", self.base_url, self.zone_id);
+                let url = format!("{}/zones/{zone_id}/dns_records", self.base_url);
                 (self.client.post(&url).json(body), "create_record")
             }
         };
@@ -198,10 +219,15 @@ impl CloudflareClient {
     }
 
     /// Delete a record by ID.
-    async fn delete_record(&self, record_id: &str, hostname: &str) -> Result<(), Error> {
+    async fn delete_record(
+        &self,
+        zone_id: &str,
+        record_id: &str,
+        hostname: &str,
+    ) -> Result<(), Error> {
         let _: serde_json::Value = self
             .send_cf(
-                self.client.delete(self.record_url(record_id)),
+                self.client.delete(self.record_url(zone_id, record_id)),
                 &format!("delete_record({hostname})"),
             )
             .await?;
@@ -213,6 +239,7 @@ impl CloudflareClient {
     /// `stats` accordingly.
     async fn ensure_record(
         &self,
+        zone_id: &str,
         existing: Option<&DnsRecord>,
         body: &CreateDnsRecord,
         dry_run: bool,
@@ -230,7 +257,7 @@ impl CloudflareClient {
                 if dry_run {
                     info!(hostname = %body.name, "[dry-run] would update {record_label}");
                 } else {
-                    self.write_record(Some(&r.id), body).await?;
+                    self.write_record(zone_id, Some(&r.id), body).await?;
                     info!(hostname = %body.name, "updated {record_label}");
                 }
                 stats.updated += 1;
@@ -239,7 +266,7 @@ impl CloudflareClient {
                 if dry_run {
                     info!(hostname = %body.name, "[dry-run] would create {record_label}");
                 } else {
-                    self.write_record(None, body).await?;
+                    self.write_record(zone_id, None, body).await?;
                     info!(hostname = %body.name, "created {record_label}");
                 }
                 stats.created += 1;
@@ -251,6 +278,7 @@ impl CloudflareClient {
     /// Delete orphaned records of a given type from the zone.
     async fn delete_orphans(
         &self,
+        scope: ZoneScope<'_>,
         records: &[DnsRecord],
         accounted: &std::collections::HashSet<&str>,
         record_type: &str,
@@ -259,8 +287,7 @@ impl CloudflareClient {
     ) -> Result<u32, Error> {
         let mut deleted = 0;
         for record in records {
-            let in_zone = record.name.ends_with(self.zones.managed_zone.as_str())
-                || record.name == self.zones.zone;
+            let in_zone = scope.org.owns_hostname(&record.name);
             if !in_zone || accounted.contains(record.name.as_str()) {
                 continue;
             }
@@ -282,7 +309,8 @@ impl CloudflareClient {
                     "[dry-run] would delete orphaned {record_type} record"
                 );
             } else {
-                self.delete_record(&record.id, &record.name).await?;
+                self.delete_record(scope.zone_id, &record.id, &record.name)
+                    .await?;
                 info!(hostname = %record.name, "deleted orphaned Cloudflare {record_type} record");
             }
             deleted += 1;
@@ -292,33 +320,51 @@ impl CloudflareClient {
 
     /// Reconcile desired DNS entries against Cloudflare's live state.
     ///
-    /// CNAME model:
-    /// 1. Ensure A record for `cname_target` with the WAN IP.
+    /// CNAME model, applied within one organization's zone:
+    /// 1. Ensure A record for the organization's `cloudflare_cname_target`
+    ///    with the WAN IP.
     /// 2. For each managed entry, ensure a CNAME (Proxied/DnsOnly) or A record (Address).
-    /// 3. Delete orphaned `*.hr-home.xyz` records not in desired state.
+    /// 3. Delete orphaned records in that organization's zone not in desired state.
+    ///
+    /// `entries` must already be filtered to this organization. An
+    /// organization with no `cloudflare_zone_id` is skipped entirely.
     pub async fn reconcile(
         &self,
+        org: &Org,
         entries: &[DnsEntry],
         wan_ip: IpAddr,
         dry_run: bool,
     ) -> Result<ReconcileStats, Error> {
-        let a_records = self.list_records_by_type("A").await?;
-        let cname_records = self.list_records_by_type("CNAME").await?;
+        let Some(zone_id) = org.cloudflare_zone_id.as_deref() else {
+            debug!(
+                org = %org.name,
+                "organization has no Cloudflare zone; skipping Cloudflare reconciliation"
+            );
+            return Ok(ReconcileStats {
+                skipped: entries.len() as u32,
+                ..ReconcileStats::default()
+            });
+        };
+        let cname_target = org.cloudflare_cname_target.as_str();
+
+        let a_records = self.list_records_by_type(zone_id, "A").await?;
+        let cname_records = self.list_records_by_type(zone_id, "CNAME").await?;
         let mut stats = ReconcileStats::default();
 
         // --- Step 1: Ensure A record for cname_target ---
-        let existing_a = a_records.iter().find(|r| r.name == self.cname_target);
+        let existing_a = a_records.iter().find(|r| r.name == cname_target);
 
         let wan_str = wan_ip.to_string();
 
         let body = CreateDnsRecord {
             record_type: "A".to_owned(),
-            name: self.cname_target.clone(),
+            name: cname_target.to_owned(),
             content: wan_str.clone(),
             ttl: 300,
             proxied: false,
         };
         self.ensure_record(
+            zone_id,
             existing_a,
             &body,
             dry_run,
@@ -337,7 +383,7 @@ impl CloudflareClient {
             std::collections::HashSet::with_capacity(entries.len());
 
         // The cname_target itself is managed as an A record, never a CNAME.
-        accounted.insert(&self.cname_target);
+        accounted.insert(cname_target);
 
         for entry in entries {
             if !entry.managed {
@@ -349,7 +395,7 @@ impl CloudflareClient {
                 continue;
             }
             // Don't create a CNAME for the cname_target itself.
-            if entry.hostname == self.cname_target {
+            if entry.hostname == cname_target {
                 continue;
             }
 
@@ -372,7 +418,7 @@ impl CloudflareClient {
                 let b = CreateDnsRecord {
                     record_type: "CNAME".to_owned(),
                     name: entry.hostname.clone(),
-                    content: self.cname_target.clone(),
+                    content: cname_target.to_owned(),
                     ttl: desired_ttl,
                     proxied: desired_proxied,
                 };
@@ -384,21 +430,23 @@ impl CloudflareClient {
             } else {
                 "CNAME record"
             };
-            self.ensure_record(existing, &body, dry_run, label, &mut stats)
+            self.ensure_record(zone_id, existing, &body, dry_run, label, &mut stats)
                 .await?;
         }
 
         // --- Step 3: Delete orphaned records ---
+        let scope = ZoneScope { org, zone_id };
         stats.deleted += self
-            .delete_orphans(&cname_records, &accounted, "CNAME", dry_run, None)
+            .delete_orphans(scope, &cname_records, &accounted, "CNAME", dry_run, None)
             .await?;
         stats.deleted += self
             .delete_orphans(
+                scope,
                 &a_records,
                 &accounted,
                 "A",
                 dry_run,
-                Some(&self.cname_target),
+                Some(cname_target),
             )
             .await?;
 
@@ -409,6 +457,7 @@ impl CloudflareClient {
                 deleted = stats.deleted,
                 skipped = stats.skipped,
                 dry_run,
+                org = %org.name,
                 "Cloudflare reconciliation complete"
             );
         }
@@ -437,6 +486,7 @@ fn test_entry(hostname: &str, managed: bool, mode: CloudflareMode) -> DnsEntry {
         reconcile_interval: Duration::from_secs(300),
         source: format!("test/{hostname}"),
         unbound_alias_target: None,
+        org: "hr-home".to_owned(),
     }
 }
 

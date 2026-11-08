@@ -6,10 +6,10 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use tracing::{info, warn};
 
-use crate::Zones;
 use crate::crd::DhcpReservation;
 use crate::discovery::parse_multus_ip;
 use crate::traefik::{IngressRoute, extract_hostnames};
+use crate::{Org, Orgs};
 
 /// The Multus network attachment name used for LAN macvlan interfaces.
 const MACVLAN_NETWORK: &str = "lan-macvlan";
@@ -54,6 +54,9 @@ pub enum Protocol {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DnsEntry {
     pub hostname: String,
+    /// Name of the organization (tenant) owning this record. Derived from the
+    /// hostname's DNS zone, or from `spec.org` for DHCP reservations.
+    pub org: String,
     pub lan_ip: IpAddr,
     pub macvlan_ip: Option<IpAddr>,
     pub cloudflare_mode: CloudflareMode,
@@ -243,22 +246,24 @@ pub fn build_desired_state(
     pod_store: &[Arc<Pod>],
     service_store: &[Arc<Service>],
     traefik_ip: IpAddr,
-    zones: &Zones,
+    orgs: &Orgs,
 ) -> DnsState {
     // Collect all (hostname, source_key, IngressRoute) tuples, then deduplicate.
-    let mut candidates: HashMap<String, (String, &IngressRoute)> = HashMap::new();
+    let mut candidates: HashMap<String, (String, &IngressRoute, &Org)> = HashMap::new();
 
     for ir in ingress_store {
         let source = source_key(&ir.metadata);
 
         for route in &ir.spec.routes {
             for hostname in extract_hostnames(&route.match_rule) {
-                if !hostname.ends_with(zones.managed_zone.as_str()) && hostname != zones.zone {
+                // The hostname's DNS zone picks the organization. A hostname in
+                // no managed zone is not ours to manage.
+                let Some(org) = orgs.for_hostname(&hostname) else {
                     continue;
-                }
+                };
 
                 match candidates.get(&hostname) {
-                    Some((existing_source, _)) if existing_source <= &source => {
+                    Some((existing_source, _, _)) if existing_source <= &source => {
                         warn!(
                             hostname,
                             existing = %existing_source,
@@ -266,17 +271,17 @@ pub fn build_desired_state(
                             "duplicate hostname across IngressRoutes, keeping lower source"
                         );
                     }
-                    Some((existing_source, _)) => {
+                    Some((existing_source, _, _)) => {
                         warn!(
                             hostname,
                             existing = %existing_source,
                             duplicate = %source,
                             "duplicate hostname across IngressRoutes, replacing with lower source"
                         );
-                        candidates.insert(hostname, (source.clone(), ir.as_ref()));
+                        candidates.insert(hostname, (source.clone(), ir.as_ref(), org));
                     }
                     None => {
-                        candidates.insert(hostname, (source.clone(), ir.as_ref()));
+                        candidates.insert(hostname, (source.clone(), ir.as_ref(), org));
                     }
                 }
             }
@@ -286,7 +291,7 @@ pub fn build_desired_state(
     // Build DnsEntry for each candidate.
     let mut state = DnsState::with_capacity(candidates.len());
 
-    for (hostname, (source, ir)) in candidates {
+    for (hostname, (source, ir, org)) in candidates {
         let labels = ir.metadata.labels.as_ref().cloned().unwrap_or_default();
         let annotations = ir
             .metadata
@@ -355,6 +360,7 @@ pub fn build_desired_state(
             hostname.clone(),
             DnsEntry {
                 hostname,
+                org: org.name.clone(),
                 lan_ip: traefik_ip,
                 macvlan_ip,
                 cloudflare_mode,
@@ -369,38 +375,53 @@ pub fn build_desired_state(
     }
 
     // Post-process: make all IngressRoute entries into Unbound aliases
-    // pointing to the anchor, except the anchor itself. For entries with
-    // macvlan IPs, emit additional `{name}-direct` A records.
+    // pointing to their organization's anchor, except the anchors themselves.
+    // For entries with macvlan IPs, emit additional `{name}-direct` A records.
     if state.is_empty() {
         return state;
     }
 
-    let anchor = zones.unbound_anchor.clone();
+    // Only organizations that actually have entries get an anchor, so a
+    // single-organization deployment produces exactly one anchor as before.
+    let orgs_present: BTreeMap<String, &Org> = state
+        .values()
+        .filter_map(|e| orgs.by_name(&e.org).map(|o| (o.name.clone(), o)))
+        .collect();
 
-    // Ensure the anchor entry exists as an A record.
-    if !state.contains_key(&anchor) {
-        state.insert(
-            anchor.clone(),
-            DnsEntry {
-                hostname: anchor.clone(),
-                lan_ip: traefik_ip,
-                macvlan_ip: None,
-                cloudflare_mode: CloudflareMode::Skip,
-                wan_expose: WanExpose::Skip,
-                dns_ttl: Duration::from_secs(300),
-                reconcile_interval: Duration::from_secs(300),
-                managed: true,
-                source: "synthetic/unbound-anchor".to_owned(),
-                unbound_alias_target: None,
-            },
-        );
+    // Ensure each present organization's anchor exists as an A record.
+    for org in orgs_present.values() {
+        let anchor = org.unbound_anchor.clone();
+        if !state.contains_key(&anchor) {
+            state.insert(
+                anchor.clone(),
+                DnsEntry {
+                    hostname: anchor,
+                    org: org.name.clone(),
+                    lan_ip: traefik_ip,
+                    macvlan_ip: None,
+                    cloudflare_mode: CloudflareMode::Skip,
+                    wan_expose: WanExpose::Skip,
+                    dns_ttl: Duration::from_secs(300),
+                    reconcile_interval: Duration::from_secs(300),
+                    managed: true,
+                    source: "synthetic/unbound-anchor".to_owned(),
+                    unbound_alias_target: None,
+                },
+            );
+        }
     }
 
     // Collect direct entries to add (can't mutate state while iterating).
     let mut direct_entries: Vec<DnsEntry> = Vec::new();
 
     for entry in state.values_mut() {
-        if entry.hostname == anchor {
+        // An entry whose organization vanished from the registry keeps its
+        // current shape rather than being silently rewritten.
+        let Some(org) = orgs_present.get(&entry.org) else {
+            continue;
+        };
+
+        if entry.hostname == org.unbound_anchor {
             // The anchor stays as an A record pointing to traefik_ip.
             // Drop the macvlan_ip — the anchor's purpose is to hold
             // traefik_ip; no -direct needed since both resolve the same way.
@@ -408,8 +429,8 @@ pub fn build_desired_state(
             continue;
         }
 
-        // All other IngressRoute entries become aliases.
-        entry.unbound_alias_target = Some(anchor.clone());
+        // All other IngressRoute entries become aliases of their own anchor.
+        entry.unbound_alias_target = Some(org.unbound_anchor.clone());
 
         // Only emit -direct when the macvlan IP differs from lan_ip
         // (traefik_ip). If they're the same there's no conflict.
@@ -418,12 +439,13 @@ pub fn build_desired_state(
                 "{}-direct.{}",
                 entry
                     .hostname
-                    .strip_suffix(&format!(".{}", zones.zone))
+                    .strip_suffix(&format!(".{}", org.zone))
                     .unwrap_or(&entry.hostname),
-                zones.zone
+                org.zone
             );
             direct_entries.push(DnsEntry {
                 hostname: direct_host,
+                org: entry.org.clone(),
                 lan_ip: mvip,
                 macvlan_ip: None,
                 cloudflare_mode: CloudflareMode::Skip,
@@ -489,14 +511,29 @@ pub fn diff(desired: &DnsState, current: &DnsState) -> DnsChanges {
 /// existing IngressRoute entry are skipped for DNS purposes — Traefik wins —
 /// but are still included in the returned `Vec` so Dnsmasq can process all
 /// static leases.
+///
+/// A reservation's `spec.org` selects the DNS zone its bare hostname is
+/// qualified into; without one it lands in the default organization's zone.
+/// Returns `(reservations, hostnames)` where `hostnames` maps each kept
+/// reservation's `spec.hostname` to the organization that owns it, so Dnsmasq
+/// can qualify the lease into the same zone.
 pub fn merge_dhcp_reservations(
     state: &mut DnsState,
     reservations: &[Arc<DhcpReservation>],
-) -> Vec<Arc<DhcpReservation>> {
-    let mut result: Vec<Arc<DhcpReservation>> = Vec::with_capacity(reservations.len());
+    orgs: &Orgs,
+) -> Vec<(Arc<DhcpReservation>, String)> {
+    let mut result: Vec<(Arc<DhcpReservation>, String)> = Vec::with_capacity(reservations.len());
 
     for reservation in reservations {
-        let hostname = format!("{}.hr-home.xyz", reservation.spec.hostname);
+        let Some(org) = orgs.resolve(reservation.spec.org.as_deref()) else {
+            warn!(
+                hostname = %reservation.spec.hostname,
+                org = reservation.spec.org.as_deref().unwrap_or("<default>"),
+                "DHCP reservation names an unknown organization, skipping"
+            );
+            continue;
+        };
+        let hostname = format!("{}.{}", reservation.spec.hostname, org.zone);
 
         if let Some(existing) = state.get(&hostname) {
             // IngressRoute already owns this hostname — skip DNS, keep for Dnsmasq.
@@ -507,7 +544,7 @@ pub fn merge_dhcp_reservations(
                 winner = %existing.source,
                 "DHCP reservation hostname already managed by IngressRoute; DNS points to Traefik, DHCP lease still created"
             );
-            result.push(Arc::clone(reservation));
+            result.push((Arc::clone(reservation), org.name.clone()));
             continue;
         }
 
@@ -528,6 +565,7 @@ pub fn merge_dhcp_reservations(
             hostname.clone(),
             DnsEntry {
                 hostname: hostname.clone(),
+                org: org.name.clone(),
                 lan_ip,
                 macvlan_ip: None,
                 cloudflare_mode: CloudflareMode::Skip,
@@ -540,7 +578,7 @@ pub fn merge_dhcp_reservations(
             },
         );
 
-        result.push(Arc::clone(reservation));
+        result.push((Arc::clone(reservation), org.name.clone()));
     }
 
     result
@@ -681,6 +719,7 @@ mod tests {
             },
             spec: crate::crd::DhcpReservationSpec {
                 hostname: hostname.to_owned(),
+                org: None,
                 mac: mac.to_owned(),
                 ip: ip.to_owned(),
                 description: None,
@@ -692,8 +731,15 @@ mod tests {
         "10.43.0.100".parse().unwrap()
     }
 
-    fn zones() -> Zones {
-        Zones::test()
+    /// Single-organization registry mirroring the historical defaults, so
+    /// every pre-existing fixture keeps its hostnames and anchor.
+    fn orgs() -> Orgs {
+        Orgs::single(Org::test())
+    }
+
+    /// The one organization those fixtures live in.
+    fn zones() -> Org {
+        Org::test()
     }
 
     // ---- Tests ----
@@ -720,7 +766,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.51/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         // Main entry becomes an alias to the anchor.
         let entry = state.get("hass.hr-home.xyz").expect("entry must exist");
@@ -764,7 +810,7 @@ mod tests {
         );
         let pod = make_pod("media", "plex-pod", labels(&[("app", "plex")]), None);
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         assert_eq!(entry.lan_ip, traefik_ip());
@@ -790,7 +836,7 @@ mod tests {
             vec![(5000, "TCP")],
         );
 
-        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("registry.hr-home.xyz").unwrap();
         assert!(!entry.managed);
@@ -806,7 +852,7 @@ mod tests {
             labels(&[("hr-home.xyz/dns", "true")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         assert!(entry.managed);
@@ -822,7 +868,7 @@ mod tests {
             labels(&[("hr-home.xyz/cloudflare", "dns-only")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         assert_eq!(entry.cloudflare_mode, CloudflareMode::DnsOnly);
@@ -838,7 +884,7 @@ mod tests {
             labels(&[("hr-home.xyz/cloudflare", "address")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         let entry = state.get("mail.hr-home.xyz").unwrap();
         assert_eq!(entry.cloudflare_mode, CloudflareMode::Address);
@@ -869,7 +915,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.52/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         match &entry.wan_expose {
@@ -908,7 +954,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.52/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         match &entry.wan_expose {
@@ -947,7 +993,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.3/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("mail.hr-home.xyz").unwrap();
         match &entry.wan_expose {
@@ -983,7 +1029,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.52/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("plex.hr-home.xyz").unwrap();
         assert_eq!(entry.wan_expose, WanExpose::Skip);
@@ -1005,6 +1051,7 @@ mod tests {
                 managed: true,
                 source: "system/old".to_owned(),
                 unbound_alias_target: None,
+                org: "hr-home".to_owned(),
             },
         );
         current.insert(
@@ -1020,6 +1067,7 @@ mod tests {
                 managed: true,
                 source: "system/same".to_owned(),
                 unbound_alias_target: None,
+                org: "hr-home".to_owned(),
             },
         );
         current.insert(
@@ -1035,6 +1083,7 @@ mod tests {
                 managed: false, // was false
                 source: "system/changed".to_owned(),
                 unbound_alias_target: None,
+                org: "hr-home".to_owned(),
             },
         );
 
@@ -1054,6 +1103,7 @@ mod tests {
                 managed: true,
                 source: "system/same".to_owned(),
                 unbound_alias_target: None,
+                org: "hr-home".to_owned(),
             },
         );
         // "changed" has managed flipped -> update
@@ -1070,6 +1120,7 @@ mod tests {
                 managed: true, // changed to true
                 source: "system/changed".to_owned(),
                 unbound_alias_target: None,
+                org: "hr-home".to_owned(),
             },
         );
         // "new" is added
@@ -1086,6 +1137,7 @@ mod tests {
                 managed: true,
                 source: "system/new".to_owned(),
                 unbound_alias_target: None,
+                org: "hr-home".to_owned(),
             },
         );
 
@@ -1111,7 +1163,7 @@ mod tests {
             labels(&[("hr-home.xyz/dns", "true")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         assert!(state.is_empty());
     }
@@ -1133,7 +1185,7 @@ mod tests {
         );
         // No pods at all (Sablier scaled to zero).
 
-        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("calibre.hr-home.xyz").unwrap();
         assert_eq!(entry.lan_ip, traefik_ip());
@@ -1158,7 +1210,7 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let state = build_desired_state(&[ir_a, ir_b], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir_a, ir_b], &[], &[], traefik_ip(), &orgs());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         // "home/hass" < "ingress/hass-redirect" lexicographically
@@ -1186,7 +1238,7 @@ mod tests {
             labels(&[("hr-home.xyz/reconcile-interval", "bogus")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         let entry = state.get("hass.hr-home.xyz").unwrap();
         assert_eq!(entry.reconcile_interval, Duration::from_secs(300));
@@ -1230,7 +1282,7 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         assert!(state.contains_key("hr-home.xyz"));
     }
@@ -1257,7 +1309,7 @@ mod tests {
             None, // no macvlan
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         let entry = state.get("registry.hr-home.xyz").unwrap();
         assert_eq!(entry.wan_expose, WanExpose::Skip);
@@ -1288,7 +1340,7 @@ mod tests {
             Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.50/24"]}]"#),
         );
 
-        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[pod], &[svc], traefik_ip(), &orgs());
 
         // Anchor is an A record (no alias target), pointing to traefik_ip.
         let anchor = state
@@ -1313,7 +1365,7 @@ mod tests {
             labels(&[("hr-home.xyz/dns", "true")]),
         );
 
-        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         // Anchor is injected synthetically.
         let anchor = state
@@ -1336,7 +1388,7 @@ mod tests {
         let mut state = DnsState::new();
         let reservation = make_dhcp_reservation("printer", "aa:bb:cc:dd:ee:ff", "192.168.2.100");
 
-        let returned = merge_dhcp_reservations(&mut state, &[reservation]);
+        let returned = merge_dhcp_reservations(&mut state, &[reservation], &orgs());
 
         assert_eq!(returned.len(), 1);
         let entry = state.get("printer.hr-home.xyz").expect("entry must exist");
@@ -1360,10 +1412,10 @@ mod tests {
             "hass-svc",
             labels(&[("hr-home.xyz/dns", "true")]),
         );
-        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         let reservation = make_dhcp_reservation("hass", "aa:bb:cc:dd:ee:ff", "192.168.2.50");
-        merge_dhcp_reservations(&mut state, &[reservation]);
+        merge_dhcp_reservations(&mut state, &[reservation], &orgs());
 
         // IngressRoute entry must be preserved, not overwritten.
         let entry = state.get("hass.hr-home.xyz").unwrap();
@@ -1380,14 +1432,15 @@ mod tests {
             "hass-svc",
             labels(&[("hr-home.xyz/dns", "true")]),
         );
-        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip(), &zones());
+        let mut state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs());
 
         let reservation = make_dhcp_reservation("hass", "aa:bb:cc:dd:ee:ff", "192.168.2.50");
-        let returned = merge_dhcp_reservations(&mut state, std::slice::from_ref(&reservation));
+        let returned =
+            merge_dhcp_reservations(&mut state, std::slice::from_ref(&reservation), &orgs());
 
         // Conflicting reservation must still appear in the returned Vec for Dnsmasq.
         assert_eq!(returned.len(), 1);
-        assert_eq!(returned[0].spec.hostname, "hass");
+        assert_eq!(returned[0].0.spec.hostname, "hass");
     }
 
     #[test]
@@ -1399,7 +1452,7 @@ mod tests {
             make_dhcp_reservation("thermostat", "aa:bb:cc:00:00:03", "192.168.2.102"),
         ];
 
-        let returned = merge_dhcp_reservations(&mut state, &reservations);
+        let returned = merge_dhcp_reservations(&mut state, &reservations, &orgs());
 
         assert_eq!(returned.len(), 3);
         assert_eq!(state.len(), 3);
@@ -1418,7 +1471,7 @@ mod tests {
         let mut state = DnsState::new();
         let reservation = make_dhcp_reservation("broken", "aa:bb:cc:dd:ee:ff", "not-an-ip");
 
-        let returned = merge_dhcp_reservations(&mut state, &[reservation]);
+        let returned = merge_dhcp_reservations(&mut state, &[reservation], &orgs());
 
         // Invalid IP reservation is not added to state or returned Vec.
         assert!(state.is_empty());
@@ -1508,7 +1561,7 @@ mod tests {
             &[plex_pod],
             &[plex_svc],
             traefik_ip(),
-            &zones(),
+            &orgs(),
         );
 
         let reservations = vec![make_dhcp_reservation(
@@ -1516,7 +1569,7 @@ mod tests {
             "aa:bb:cc:dd:ee:ff",
             "192.168.2.100",
         )];
-        let _ = merge_dhcp_reservations(&mut state, &reservations);
+        let _ = merge_dhcp_reservations(&mut state, &reservations, &orgs());
 
         state
     }
@@ -1532,5 +1585,157 @@ plex.hr-home.xyz lan=10.43.0.100 mv=Some(\"192.168.2.40\") cf=Proxied wan=Expose
 wiki.hr-home.xyz lan=10.43.0.100 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed=true alias=Some(\"ha.hr-home.xyz\") src=fida/wiki
 ";
         assert_eq!(snapshot(&golden_state()), expected);
+    }
+    // -----------------------------------------------------------------------
+    // Multi-organization behaviour
+    // -----------------------------------------------------------------------
+
+    /// A registry holding hr-home (default) plus quota-fitness.
+    fn two_orgs() -> Orgs {
+        let mut orgs = Orgs::single(Org::test());
+        let mut quota = Org::new("quota-fitness", "quota.fitness");
+        quota.cloudflare_zone_id = Some("zone-quota".to_owned());
+        quota.zitadel_org_id = Some("398686617688080562".to_owned());
+        orgs.extend([quota]);
+        orgs
+    }
+
+    #[test]
+    fn hostname_picks_its_organization_by_zone() {
+        let orgs = two_orgs();
+        assert_eq!(
+            orgs.for_hostname("lists.quota.fitness").map(|o| &*o.name),
+            Some("quota-fitness")
+        );
+        assert_eq!(
+            orgs.for_hostname("plex.hr-home.xyz").map(|o| &*o.name),
+            Some("hr-home")
+        );
+        // A hostname in no managed zone belongs to no organization.
+        assert!(orgs.for_hostname("example.org").is_none());
+    }
+
+    #[test]
+    fn nested_zone_resolves_to_the_most_specific_organization() {
+        let mut orgs = Orgs::single(Org::test());
+        orgs.extend([Org::new("sub", "sub.hr-home.xyz")]);
+        assert_eq!(
+            orgs.for_hostname("a.sub.hr-home.xyz").map(|o| &*o.name),
+            Some("sub")
+        );
+        assert_eq!(
+            orgs.for_hostname("a.hr-home.xyz").map(|o| &*o.name),
+            Some("hr-home")
+        );
+    }
+
+    #[test]
+    fn unknown_organization_name_does_not_fall_back_to_default() {
+        let orgs = two_orgs();
+        assert!(orgs.resolve(Some("nope")).is_none());
+        assert_eq!(orgs.resolve(None).map(|o| &*o.name), Some("hr-home"));
+    }
+
+    #[test]
+    fn each_organization_gets_its_own_anchor_and_direct_records() {
+        let orgs = two_orgs();
+
+        let lists_ir = make_ingress_route(
+            "quota",
+            "listmonk",
+            "Host(`lists.quota.fitness`)",
+            "listmonk",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+        let plex_ir = make_ingress_route(
+            "media",
+            "plex",
+            "Host(`plex.hr-home.xyz`)",
+            "plex",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+        let svc = make_service("quota", "listmonk", labels(&[("app", "listmonk")]), vec![]);
+        let pod = make_pod(
+            "quota",
+            "listmonk-pod",
+            labels(&[("app", "listmonk")]),
+            Some(r#"[{"name":"default/lan-macvlan","ips":["192.168.2.60/24"]}]"#),
+        );
+
+        let state = build_desired_state(&[lists_ir, plex_ir], &[pod], &[svc], traefik_ip(), &orgs);
+
+        // Both anchors exist, each owned by its own organization.
+        assert_eq!(state["ha.quota.fitness"].org, "quota-fitness");
+        assert_eq!(state["ha.hr-home.xyz"].org, "hr-home");
+
+        // Each hostname aliases its own organization's anchor, never the other's.
+        assert_eq!(
+            state["lists.quota.fitness"].unbound_alias_target.as_deref(),
+            Some("ha.quota.fitness")
+        );
+        assert_eq!(
+            state["plex.hr-home.xyz"].unbound_alias_target.as_deref(),
+            Some("ha.hr-home.xyz")
+        );
+
+        // The -direct record lands in its own organization's zone.
+        let direct = &state["lists-direct.quota.fitness"];
+        assert_eq!(direct.org, "quota-fitness");
+        assert_eq!(direct.lan_ip.to_string(), "192.168.2.60");
+    }
+
+    #[test]
+    fn dhcp_reservation_is_qualified_into_its_organizations_zone() {
+        let orgs = two_orgs();
+        let mut state = DnsState::new();
+
+        let mut scale = make_dhcp_reservation("scale", "aa:bb:cc:dd:ee:01", "192.168.2.101");
+        Arc::get_mut(&mut scale).unwrap().spec.org = Some("quota-fitness".to_owned());
+        let sensor = make_dhcp_reservation("kitchen-sensor", "aa:bb:cc:dd:ee:02", "192.168.2.102");
+
+        let kept = merge_dhcp_reservations(&mut state, &[scale, sensor], &orgs);
+
+        assert!(state.contains_key("scale.quota.fitness"));
+        assert_eq!(state["scale.quota.fitness"].org, "quota-fitness");
+        assert!(state.contains_key("kitchen-sensor.hr-home.xyz"));
+        assert_eq!(state["kitchen-sensor.hr-home.xyz"].org, "hr-home");
+
+        // Each kept reservation reports the organization Dnsmasq should use.
+        let by_host: BTreeMap<&str, &str> = kept
+            .iter()
+            .map(|(r, org)| (r.spec.hostname.as_str(), org.as_str()))
+            .collect();
+        assert_eq!(by_host["scale"], "quota-fitness");
+        assert_eq!(by_host["kitchen-sensor"], "hr-home");
+    }
+
+    #[test]
+    fn dhcp_reservation_naming_an_unknown_organization_is_skipped() {
+        let orgs = two_orgs();
+        let mut state = DnsState::new();
+
+        let mut bogus = make_dhcp_reservation("ghost", "aa:bb:cc:dd:ee:03", "192.168.2.103");
+        Arc::get_mut(&mut bogus).unwrap().spec.org = Some("does-not-exist".to_owned());
+
+        let kept = merge_dhcp_reservations(&mut state, &[bogus], &orgs);
+
+        assert!(
+            state.is_empty(),
+            "no DNS record for an unknown organization"
+        );
+        assert!(kept.is_empty(), "and no DHCP lease either");
+    }
+
+    #[test]
+    fn hostname_outside_every_managed_zone_is_ignored() {
+        let ir = make_ingress_route(
+            "media",
+            "external",
+            "Host(`service.example.org`)",
+            "external",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &two_orgs());
+        assert!(state.is_empty());
     }
 }

@@ -126,6 +126,7 @@ mod tests {
 
     fn make_oidc_app(name: &str, project: &str, mw_name: &str) -> Arc<OidcApplication> {
         let spec = OidcApplicationSpec {
+            org: None,
             project_name: project.to_owned(),
             app_name: name.to_owned(),
             middleware: OidcMiddlewareSpec {

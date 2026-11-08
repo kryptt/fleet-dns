@@ -10,9 +10,16 @@ use tracing::{debug, info};
 use crate::crd::CoreDnsPolicy;
 use crate::error::Error;
 use crate::state::DnsEntry;
+use crate::{Org, Orgs};
 
-/// ConfigMap key for the zone server block.
-const SERVER_KEY: &str = "hr-home-xyz.server";
+/// ConfigMap key holding an organization's zone server block.
+///
+/// `hr-home.xyz` yields `hr-home-xyz.server`, the key this ConfigMap has
+/// always used, so a single-organization deployment keeps its exact key.
+#[must_use]
+pub fn server_key(zone: &str) -> String {
+    format!("{}.server", zone.replace('.', "-"))
+}
 
 /// ConfigMap name in kube-system that CoreDNS reads custom overrides from.
 const CONFIGMAP_NAME: &str = "coredns-custom";
@@ -20,46 +27,88 @@ const CONFIGMAP_NAME: &str = "coredns-custom";
 /// Namespace where CoreDNS runs.
 const CONFIGMAP_NAMESPACE: &str = "kube-system";
 
+/// Resolve the zone a policy applies to: explicit `spec.zone` wins, else the
+/// zone of `spec.org`, else `None` for a non-zone policy.
+fn policy_zone(policy: &CoreDnsPolicy, orgs: &Orgs) -> Option<String> {
+    if let Some(zone) = policy.spec.zone.as_deref() {
+        return Some(zone.to_owned());
+    }
+    let org_name = policy.spec.org.as_deref()?;
+    match orgs.by_name(org_name) {
+        Some(org) => Some(org.zone.clone()),
+        None => {
+            debug!(
+                policy = policy.spec.key.as_str(),
+                org = org_name,
+                "CoreDnsPolicy names an unknown organization; treating as non-zone policy"
+            );
+            None
+        }
+    }
+}
+
 /// Render the ConfigMap `data` keys from DNS entries and CoreDNS policies.
 ///
-/// Non-zone policies (where `spec.zone` is `None`) each become their own
-/// ConfigMap key. Zone-scoped entries and policies are merged into a single
-/// `hr-home-xyz.server` key containing a CoreDNS server block.
+/// Policies scoped to no zone (neither `spec.zone` nor `spec.org`) each become
+/// their own ConfigMap key. Everything else is grouped by organization: each
+/// organization holding at least one entry or zone-scoped policy gets a
+/// `{zone-with-dashes}.server` key containing a CoreDNS server block.
 #[must_use]
 pub fn render_configmap_data(
     entries: &[DnsEntry],
     policies: &[Arc<CoreDnsPolicy>],
-    zone: &str,
+    orgs: &Orgs,
 ) -> BTreeMap<String, String> {
     let mut data = BTreeMap::new();
 
     // --- Non-zone policies: each gets its own key ---
     for policy in policies {
-        if policy.spec.zone.is_none() {
+        if policy_zone(policy, orgs).is_none() {
             data.insert(policy.spec.key.clone(), policy.spec.content.clone());
         }
     }
 
-    // --- Zone server block ---
-    let server_block = render_server_block(zone, entries, policies);
-    data.insert(SERVER_KEY.to_owned(), server_block);
+    // --- One server block per organization ---
+    for org in orgs.iter() {
+        let org_entries: Vec<DnsEntry> = entries
+            .iter()
+            .filter(|e| e.org == org.name)
+            .cloned()
+            .collect();
+
+        // The default organization always renders a server block, even when
+        // empty, so its key never disappears from the ConfigMap. Additional
+        // organizations appear only once they have something to say.
+        let has_policies = policies
+            .iter()
+            .any(|p| policy_zone(p, orgs).as_deref() == Some(org.zone.as_str()));
+        if org.name != orgs.default_org().name && org_entries.is_empty() && !has_policies {
+            continue;
+        }
+
+        let server_block = render_server_block(org, &org_entries, policies, orgs);
+        data.insert(server_key(&org.zone), server_block);
+    }
 
     data
 }
 
-/// Build the `hr-home.xyz:53 { ... }` server block.
+/// Build the `hr-home.xyz:53 { ... }` server block for one organization.
 fn render_server_block(
-    zone: &str,
+    org: &Org,
     entries: &[DnsEntry],
     policies: &[Arc<CoreDnsPolicy>],
+    orgs: &Orgs,
 ) -> String {
+    let zone = org.zone.as_str();
+
     // Group hostnames by lan_ip, sorted for determinism.
     let hosts_block = render_hosts_block(entries);
 
     // Collect zone-scoped policy content fragments.
     let mut zone_policies: Vec<&str> = policies
         .iter()
-        .filter(|p| p.spec.zone.as_deref() == Some(zone))
+        .filter(|p| policy_zone(p, orgs).as_deref() == Some(zone))
         .map(|p| p.spec.content.as_str())
         .collect();
     zone_policies.sort();
@@ -163,7 +212,6 @@ pub async fn apply_configmap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Zones;
     use crate::crd::CoreDnsPolicySpec;
     use crate::state::{CloudflareMode, WanExpose};
     use kube::api::ObjectMeta;
@@ -182,6 +230,7 @@ mod tests {
             managed: true,
             source: "test/test".to_owned(),
             unbound_alias_target: None,
+            org: "hr-home".to_owned(),
         }
     }
 
@@ -196,14 +245,23 @@ mod tests {
             spec: CoreDnsPolicySpec {
                 policy_type: "template".to_owned(),
                 zone: zone.map(str::to_owned),
+                org: None,
                 key: key.to_owned(),
                 content: content.to_owned(),
             },
         })
     }
 
+    /// Single-organization registry mirroring the historical defaults.
+    fn test_orgs() -> Orgs {
+        Orgs::single(Org::test())
+    }
+
+    /// The ConfigMap key the single-organization deployment has always used.
+    const SERVER_KEY: &str = "hr-home-xyz.server";
+
     fn render_server(entries: &[DnsEntry], policies: &[Arc<CoreDnsPolicy>]) -> String {
-        let data = render_configmap_data(entries, policies, &Zones::test().zone);
+        let data = render_configmap_data(entries, policies, &test_orgs());
         data.get(SERVER_KEY).unwrap().clone()
     }
 
@@ -222,7 +280,7 @@ mod tests {
             policy("search-fix.override", search_content, Some("hr-home.xyz")),
         ];
 
-        let data = render_configmap_data(&entries, &policies, &Zones::test().zone);
+        let data = render_configmap_data(&entries, &policies, &test_orgs());
 
         // Non-zone policy gets its own key.
         assert_eq!(data.get("no-aaaa.override").unwrap(), aaaa_content);
@@ -317,8 +375,8 @@ mod tests {
             entry("middle.hr-home.xyz", "172.16.0.5"),
         ];
 
-        let data_a = render_configmap_data(&entries, &[], &Zones::test().zone);
-        let data_b = render_configmap_data(&entries, &[], &Zones::test().zone);
+        let data_a = render_configmap_data(&entries, &[], &test_orgs());
+        let data_b = render_configmap_data(&entries, &[], &test_orgs());
 
         assert_eq!(data_a, data_b, "output must be deterministic");
 
@@ -363,7 +421,7 @@ mod tests {
             ),
         ];
 
-        let data = render_configmap_data(&entries, &policies, &Zones::test().zone);
+        let data = render_configmap_data(&entries, &policies, &test_orgs());
 
         let keys: Vec<&str> = data.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["hr-home-xyz.server", "no-aaaa.override"]);
@@ -385,6 +443,119 @@ hr-home.xyz:53 {
   forward . /etc/resolv.conf
   cache 30
 }"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // Multi-organization rendering
+    // -----------------------------------------------------------------------
+
+    /// hr-home (default) plus quota-fitness.
+    fn two_orgs() -> Orgs {
+        let mut orgs = Orgs::single(Org::test());
+        orgs.extend([Org::new("quota-fitness", "quota.fitness")]);
+        orgs
+    }
+
+    /// A DNS entry owned by a named organization.
+    fn org_entry(hostname: &str, ip: &str, org: &str) -> DnsEntry {
+        let mut e = entry(hostname, ip);
+        e.org = org.to_owned();
+        e
+    }
+
+    #[test]
+    fn server_key_matches_the_historical_name() {
+        assert_eq!(server_key("hr-home.xyz"), "hr-home-xyz.server");
+        assert_eq!(server_key("quota.fitness"), "quota-fitness.server");
+    }
+
+    #[test]
+    fn registering_a_second_organization_leaves_the_first_untouched() {
+        let entries = vec![org_entry("plex.hr-home.xyz", "10.43.0.100", "hr-home")];
+
+        // Same entries, rendered against a one-org and a two-org registry.
+        let one = render_configmap_data(&entries, &[], &test_orgs());
+        let two = render_configmap_data(&entries, &[], &two_orgs());
+
+        // An organization with nothing in it contributes no key at all, so the
+        // ConfigMap is identical.
+        assert_eq!(one, two);
+        assert_eq!(
+            two.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["hr-home-xyz.server"]
+        );
+    }
+
+    #[test]
+    fn each_organization_renders_its_own_server_block() {
+        let entries = vec![
+            org_entry("plex.hr-home.xyz", "10.43.0.100", "hr-home"),
+            org_entry("lists.quota.fitness", "10.43.0.100", "quota-fitness"),
+        ];
+
+        let data = render_configmap_data(&entries, &[], &two_orgs());
+
+        assert_eq!(
+            data.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["hr-home-xyz.server", "quota-fitness.server"]
+        );
+
+        // Each block carries only its own organization's hostnames.
+        let hr = &data["hr-home-xyz.server"];
+        assert!(hr.starts_with("hr-home.xyz:53 {"));
+        assert!(hr.contains("plex.hr-home.xyz"));
+        assert!(!hr.contains("lists.quota.fitness"));
+
+        let quota = &data["quota-fitness.server"];
+        assert!(quota.starts_with("quota.fitness:53 {"));
+        assert!(quota.contains("lists.quota.fitness"));
+        assert!(!quota.contains("plex.hr-home.xyz"));
+    }
+
+    #[test]
+    fn policy_org_selects_the_zone_block() {
+        let mut p = policy(
+            "quota-fix.override",
+            "template IN A x {\n  answer \"y\"\n}",
+            None,
+        );
+        Arc::get_mut(&mut p).unwrap().spec.org = Some("quota-fitness".to_owned());
+
+        let data = render_configmap_data(&[], &[p], &two_orgs());
+
+        // The policy pulled the quota block into existence and landed inside
+        // it, rather than becoming a standalone key.
+        assert!(data.contains_key("quota-fitness.server"));
+        assert!(data["quota-fitness.server"].contains("template IN A x"));
+        assert!(!data.contains_key("quota-fix.override"));
+    }
+
+    #[test]
+    fn explicit_zone_wins_over_org_on_a_policy() {
+        let mut p = policy(
+            "pinned.override",
+            "template IN A z {\n  answer \"w\"\n}",
+            Some("hr-home.xyz"),
+        );
+        Arc::get_mut(&mut p).unwrap().spec.org = Some("quota-fitness".to_owned());
+
+        let data = render_configmap_data(&[], &[p], &two_orgs());
+
+        assert!(data["hr-home-xyz.server"].contains("template IN A z"));
+        assert!(!data.contains_key("quota-fitness.server"));
+    }
+
+    #[test]
+    fn policy_naming_an_unknown_organization_becomes_a_standalone_key() {
+        let content = "template IN AAAA {\n  rcode NXDOMAIN\n}";
+        let mut p = policy("orphan.override", content, None);
+        Arc::get_mut(&mut p).unwrap().spec.org = Some("gone".to_owned());
+
+        let data = render_configmap_data(&[], &[p], &two_orgs());
+
+        assert_eq!(
+            data.get("orphan.override").map(String::as_str),
+            Some(content)
         );
     }
 }

@@ -21,6 +21,18 @@ pub struct ZitadelProject {
     pub name: String,
 }
 
+/// A Zitadel organization, as returned by the admin API.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZitadelOrg {
+    pub id: String,
+    pub name: String,
+    /// The organization's primary domain, e.g. `fida.finance`. Used as the
+    /// organization's DNS zone unless org metadata overrides it.
+    #[serde(default)]
+    pub primary_domain: Option<String>,
+}
+
 /// A Zitadel OIDC application, as returned by the management API.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +75,26 @@ pub struct OidcConfig {
 struct ProjectSearchResponse {
     #[serde(default)]
     result: Vec<ZitadelProject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrgSearchResponse {
+    #[serde(default)]
+    result: Vec<ZitadelOrg>,
+}
+
+/// One org-metadata key/value pair. Values are base64-encoded on the wire.
+#[derive(Debug, Deserialize)]
+struct OrgMetadata {
+    key: String,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrgMetadataSearchResponse {
+    #[serde(default)]
+    result: Vec<OrgMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,17 +316,27 @@ impl ZitadelClient {
     // Request helpers
     // -----------------------------------------------------------------------
 
-    /// Build an authenticated request with the given HTTP method.
+    /// Build an authenticated request with the given HTTP method, scoped to an
+    /// organization when one is given.
+    ///
+    /// `org_id` of `None` targets the service account's own default
+    /// organization, which is how every call behaved before organizations
+    /// existed — so omitting it preserves the original behaviour exactly.
     async fn authed_request(
         &self,
         method: reqwest::Method,
         path: &str,
+        org_id: Option<&str>,
     ) -> Result<reqwest::RequestBuilder, Error> {
         let token = self.access_token().await?;
-        Ok(self
+        let mut req = self
             .client
             .request(method, format!("{}{path}", self.base_url))
-            .bearer_auth(token))
+            .bearer_auth(token);
+        if let Some(org) = org_id {
+            req = req.header("x-zitadel-orgid", org);
+        }
+        Ok(req)
     }
 
     /// Send a request, verify the status is successful, and return the response.
@@ -329,9 +371,10 @@ impl ZitadelClient {
         path: &str,
         body: &B,
         operation: &str,
+        org_id: Option<&str>,
     ) -> Result<R, Error> {
         let req = self
-            .authed_request(reqwest::Method::POST, path)
+            .authed_request(reqwest::Method::POST, path, org_id)
             .await?
             .json(body);
         let resp = self.send_and_check(req, operation).await?;
@@ -342,13 +385,14 @@ impl ZitadelClient {
     // Project operations
     // -----------------------------------------------------------------------
 
-    /// List all projects visible to the service user.
-    pub async fn list_projects(&self) -> Result<Vec<ZitadelProject>, Error> {
+    /// List all projects visible to the service user in an organization.
+    pub async fn list_projects(&self, org_id: Option<&str>) -> Result<Vec<ZitadelProject>, Error> {
         let resp: ProjectSearchResponse = self
             .post_json(
                 "/management/v1/projects/_search",
                 &serde_json::json!({}),
                 "list_projects",
+                org_id,
             )
             .await?;
 
@@ -356,11 +400,69 @@ impl ZitadelClient {
         Ok(resp.result)
     }
 
-    /// Find a project by exact name, returning its ID if found.
-    pub async fn find_project_by_name(&self, name: &str) -> Result<Option<String>, Error> {
-        let projects = self.list_projects().await?;
+    /// Find a project by exact name within an organization, returning its ID.
+    pub async fn find_project_by_name(
+        &self,
+        name: &str,
+        org_id: Option<&str>,
+    ) -> Result<Option<String>, Error> {
+        let projects = self.list_projects(org_id).await?;
         let found = projects.into_iter().find(|p| p.name == name).map(|p| p.id);
         Ok(found)
+    }
+
+    // -----------------------------------------------------------------------
+    // Organization operations
+    // -----------------------------------------------------------------------
+
+    /// List every organization in the instance.
+    ///
+    /// Requires instance-level org read permission. Callers treat a failure as
+    /// "only the default organization exists" rather than fatal.
+    pub async fn list_orgs(&self) -> Result<Vec<ZitadelOrg>, Error> {
+        let resp: OrgSearchResponse = self
+            .post_json(
+                "/admin/v1/orgs/_search",
+                &serde_json::json!({}),
+                "list_orgs",
+                None,
+            )
+            .await?;
+
+        info!(count = resp.result.len(), "listed Zitadel organizations");
+        Ok(resp.result)
+    }
+
+    /// Read one org-metadata value, decoding it from base64.
+    ///
+    /// Used for the `dnsZone` key, which lets an organization declare a DNS
+    /// zone that differs from its Zitadel primary domain.
+    pub async fn org_metadata(&self, org_id: &str, key: &str) -> Result<Option<String>, Error> {
+        let resp: OrgMetadataSearchResponse = self
+            .post_json(
+                "/management/v1/orgs/me/metadata/_search",
+                &serde_json::json!({}),
+                "org_metadata",
+                Some(org_id),
+            )
+            .await?;
+
+        let Some(raw) = resp
+            .result
+            .into_iter()
+            .find(|m| m.key == key)
+            .and_then(|m| m.value)
+        else {
+            return Ok(None);
+        };
+
+        // Zitadel base64-encodes metadata values on the wire.
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &raw)
+            .map_err(|e| Error::Zitadel(format!("org metadata {key} is not valid base64: {e}")))?;
+        let value = String::from_utf8(decoded)
+            .map_err(|e| Error::Zitadel(format!("org metadata {key} is not valid UTF-8: {e}")))?;
+
+        Ok(Some(value.trim().to_owned()))
     }
 
     // -----------------------------------------------------------------------
@@ -368,10 +470,14 @@ impl ZitadelClient {
     // -----------------------------------------------------------------------
 
     /// List all applications in a project.
-    pub async fn list_apps(&self, project_id: &str) -> Result<Vec<ZitadelApp>, Error> {
+    pub async fn list_apps(
+        &self,
+        project_id: &str,
+        org_id: Option<&str>,
+    ) -> Result<Vec<ZitadelApp>, Error> {
         let path = format!("/management/v1/projects/{project_id}/apps/_search");
         let resp: AppSearchResponse = self
-            .post_json(&path, &serde_json::json!({}), "list_apps")
+            .post_json(&path, &serde_json::json!({}), "list_apps", org_id)
             .await?;
 
         info!(project_id, count = resp.result.len(), "listed Zitadel apps");
@@ -386,6 +492,7 @@ impl ZitadelClient {
         project_id: &str,
         name: &str,
         redirect_uris: &[String],
+        org_id: Option<&str>,
     ) -> Result<(String, String), Error> {
         let path = format!("/management/v1/projects/{project_id}/apps/oidc");
 
@@ -394,7 +501,9 @@ impl ZitadelClient {
             config: OidcConfigFields::new(redirect_uris.to_vec()),
         };
 
-        let resp: CreateOidcAppResponse = self.post_json(&path, &body, "create_oidc_app").await?;
+        let resp: CreateOidcAppResponse = self
+            .post_json(&path, &body, "create_oidc_app", org_id)
+            .await?;
 
         info!(
             project_id,
@@ -413,13 +522,14 @@ impl ZitadelClient {
         project_id: &str,
         app_id: &str,
         redirect_uris: &[String],
+        org_id: Option<&str>,
     ) -> Result<(), Error> {
         let path = format!("/management/v1/projects/{project_id}/apps/{app_id}/oidc_config");
 
         let body = OidcConfigFields::new(redirect_uris.to_vec());
 
         let req = self
-            .authed_request(reqwest::Method::PUT, &path)
+            .authed_request(reqwest::Method::PUT, &path, org_id)
             .await?
             .json(&body);
         self.send_checked(req, "update_oidc_config").await?;
@@ -429,10 +539,17 @@ impl ZitadelClient {
     }
 
     /// Delete an application from a project.
-    pub async fn delete_app(&self, project_id: &str, app_id: &str) -> Result<(), Error> {
+    pub async fn delete_app(
+        &self,
+        project_id: &str,
+        app_id: &str,
+        org_id: Option<&str>,
+    ) -> Result<(), Error> {
         let path = format!("/management/v1/projects/{project_id}/apps/{app_id}");
 
-        let req = self.authed_request(reqwest::Method::DELETE, &path).await?;
+        let req = self
+            .authed_request(reqwest::Method::DELETE, &path, org_id)
+            .await?;
         self.send_checked(req, "delete_app").await?;
 
         info!(project_id, app_id, "deleted Zitadel app");

@@ -168,11 +168,12 @@ impl Reconciler {
 
         // 3. Build desired state.
         let mut desired =
-            build_desired_state(&ingresses, &pods, &services, traefik_ip, &self.config.zones);
+            build_desired_state(&ingresses, &pods, &services, traefik_ip, &self.config.orgs);
 
         // 3b. Merge DHCP reservations into DNS state.
         let reservations: Vec<_> = self.reservation_store.state();
-        let all_reservations = merge_dhcp_reservations(&mut desired, &reservations);
+        let all_reservations =
+            merge_dhcp_reservations(&mut desired, &reservations, &self.config.orgs);
         let dhcp_configs: Vec<_> = self.dhcp_config_store.state();
 
         // 4. Get current WAN IP from OPNsense.
@@ -212,6 +213,7 @@ impl Reconciler {
                 self.kube_client.clone(),
                 &oidc_desired,
                 zitadel_url,
+                &self.config.orgs,
                 self.config.dry_run,
             )
             .await;
@@ -255,7 +257,7 @@ impl Reconciler {
 
         // -- CoreDNS (internal, ALL entries unconditionally) --
         let configmap_data =
-            coredns::render_configmap_data(&all_entries, &policies, &self.config.zones.zone);
+            coredns::render_configmap_data(&all_entries, &policies, &self.config.orgs);
         if let Err(e) = coredns::apply_configmap(
             self.kube_client.clone(),
             configmap_data,
@@ -276,21 +278,40 @@ impl Reconciler {
         }
 
         // -- Cloudflare (external, managed-only entries; skip if NAT failed) --
+        // One pass per organization: each writes only into its own zone, so a
+        // failure in one organization cannot delete another's records.
         if nat_ok {
-            let cf_result = self
-                .cloudflare
-                .reconcile(&all_entries, wan_ip, self.config.dry_run)
-                .await;
-            self.record_target_result("cloudflare", "cloudflare", &cf_result, false);
+            for org in self.config.orgs.iter() {
+                let org_entries: Vec<_> = all_entries
+                    .iter()
+                    .filter(|e| e.org == org.name)
+                    .cloned()
+                    .collect();
+                if org_entries.is_empty() {
+                    continue;
+                }
+                let cf_result = self
+                    .cloudflare
+                    .reconcile(org, &org_entries, wan_ip, self.config.dry_run)
+                    .await;
+                self.record_target_result("cloudflare", "cloudflare", &cf_result, false);
+            }
         }
 
         // -- Dnsmasq (DHCP host reservations + range) --
         let host_entries: Vec<DhcpHostEntry> = all_reservations
             .iter()
-            .map(|r| DhcpHostEntry {
+            .map(|(r, org_name)| DhcpHostEntry {
                 hostname: r.spec.hostname.clone(),
                 ip: r.spec.ip.clone(),
                 mac: r.spec.mac.clone(),
+                zone: self
+                    .config
+                    .orgs
+                    .by_name(org_name)
+                    .unwrap_or_else(|| self.config.orgs.default_org())
+                    .zone
+                    .clone(),
             })
             .collect();
 
@@ -318,9 +339,18 @@ impl Reconciler {
                     .ip_conflicts_total
                     .inc_by(conflicts.len() as u64);
             } else {
+                let range_org = self
+                    .config
+                    .orgs
+                    .resolve(dhcp_config.spec.org.as_deref())
+                    .unwrap_or_else(|| self.config.orgs.default_org());
                 match self
                     .opnsense
-                    .reconcile_dnsmasq_range(&dhcp_config.spec, self.config.dry_run)
+                    .reconcile_dnsmasq_range(
+                        &dhcp_config.spec,
+                        &range_org.zone,
+                        self.config.dry_run,
+                    )
                     .await
                 {
                     Ok(_stats) => {}
@@ -437,19 +467,38 @@ async fn reconcile_oidc(
     kube: Client,
     desired: &BTreeMap<String, OidcAppDesired>,
     zitadel_url: &str,
+    orgs: &crate::Orgs,
     dry_run: bool,
 ) -> Result<ReconcileStats, Error> {
     // Accumulate create/update/delete counts across all OIDC apps.
     let mut stats = ReconcileStats::default();
 
     for (name, app) in desired {
-        // Resolve project ID from name.
-        let project_id = match zitadel.find_project_by_name(&app.spec.project_name).await? {
+        // Resolve the organization holding the project. An app naming an
+        // unknown organization is skipped rather than written to the default
+        // one, so a typo can never create an app in the wrong tenant.
+        let Some(org) = orgs.resolve(app.spec.org.as_deref()) else {
+            warn!(
+                crd = name,
+                org = app.spec.org.as_deref().unwrap_or("<default>"),
+                "OidcApplication names an unknown organization, skipping"
+            );
+            stats.skipped += 1;
+            continue;
+        };
+        let org_id = org.zitadel_org_id.as_deref();
+
+        // Resolve project ID from name, within that organization.
+        let project_id = match zitadel
+            .find_project_by_name(&app.spec.project_name, org_id)
+            .await?
+        {
             Some(id) => id,
             None => {
                 warn!(
                     crd = name,
                     project = app.spec.project_name,
+                    org = %org.name,
                     "Zitadel project not found, skipping OIDC app"
                 );
                 stats.skipped += 1;
@@ -460,7 +509,7 @@ async fn reconcile_oidc(
         let redirect_uris: Vec<String> = app.redirect_uris.iter().cloned().collect();
 
         // Check if the app already exists in Zitadel.
-        let existing = zitadel.list_apps(&project_id).await?;
+        let existing = zitadel.list_apps(&project_id, org_id).await?;
         let found = existing.iter().find(|a| a.name == app.spec.app_name);
 
         match found {
@@ -494,7 +543,12 @@ async fn reconcile_oidc(
                         stats.updated += 1;
                     } else {
                         zitadel
-                            .update_oidc_config(&project_id, &existing_app.id, &redirect_uris)
+                            .update_oidc_config(
+                                &project_id,
+                                &existing_app.id,
+                                &redirect_uris,
+                                org_id,
+                            )
                             .await?;
                         info!(
                             app = app.spec.app_name,
@@ -514,6 +568,7 @@ async fn reconcile_oidc(
                         &app.spec,
                         client_id,
                         &project_id,
+                        org_id,
                         dry_run,
                         zitadel_url,
                     )
@@ -535,13 +590,14 @@ async fn reconcile_oidc(
                     );
                 } else {
                     let (app_id, client_id) = zitadel
-                        .create_oidc_app(&project_id, &app.spec.app_name, &redirect_uris)
+                        .create_oidc_app(&project_id, &app.spec.app_name, &redirect_uris, org_id)
                         .await?;
                     ensure_middleware(
                         &kube,
                         &app.spec,
                         &client_id,
                         &project_id,
+                        org_id,
                         dry_run,
                         zitadel_url,
                     )
@@ -599,6 +655,9 @@ async fn reconcile_oidc(
         };
         let app_name = label_val("fleet-dns.hr-home.xyz/oidc-app");
         let project_id = label_val("fleet-dns.hr-home.xyz/project-id");
+        // Empty label (or none at all, on Middlewares written before
+        // organizations existed) means the service account's default org.
+        let org_id = Some(label_val("fleet-dns.hr-home.xyz/org-id")).filter(|v| !v.is_empty());
 
         if dry_run {
             info!(
@@ -610,11 +669,14 @@ async fn reconcile_oidc(
             // Clear redirect URIs in Zitadel (keep the app itself).
             if !project_id.is_empty()
                 && !app_name.is_empty()
-                && let Ok(apps) = zitadel.list_apps(project_id).await
+                && let Ok(apps) = zitadel.list_apps(project_id, org_id).await
                 && let Some(found) = apps.iter().find(|a| a.name == app_name)
                 && !found.redirect_uris().is_empty()
             {
-                if let Err(e) = zitadel.update_oidc_config(project_id, &found.id, &[]).await {
+                if let Err(e) = zitadel
+                    .update_oidc_config(project_id, &found.id, &[], org_id)
+                    .await
+                {
                     warn!(
                         app = app_name,
                         error = %e,
@@ -650,6 +712,7 @@ async fn ensure_middleware(
     spec: &crate::crd::OidcApplicationSpec,
     client_id: &str,
     project_id: &str,
+    org_id: Option<&str>,
     dry_run: bool,
     zitadel_url: &str,
 ) -> Result<(), Error> {
@@ -728,6 +791,7 @@ async fn ensure_middleware(
                 "fleet-dns.hr-home.xyz/managed": "true",
                 "fleet-dns.hr-home.xyz/oidc-app": spec.app_name,
                 "fleet-dns.hr-home.xyz/project-id": project_id,
+                "fleet-dns.hr-home.xyz/org-id": org_id.unwrap_or_default(),
             }
         },
         "spec": {

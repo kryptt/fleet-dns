@@ -19,8 +19,15 @@ fleet_crd! {
     /// "template" or "hosts"
     pub policy_type: String,
 
-    /// DNS zone this policy applies to (e.g. "hr-home.xyz").
+    /// DNS zone this policy applies to (e.g. "hr-home.xyz"). Takes precedence
+    /// over `org` when both are set.
     pub zone: Option<String>,
+
+    /// Organization whose DNS zone this policy applies to. An alternative to
+    /// spelling the zone out in `zone`; ignored when `zone` is set. Absent
+    /// from both means a non-zone policy, which gets its own ConfigMap key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
 
     /// ConfigMap key name where this fragment is stored.
     pub key: String,
@@ -46,6 +53,11 @@ fleet_crd! {
     /// Hostname to associate with this reservation.
     pub hostname: String,
 
+    /// Organization whose DNS zone this reservation's bare hostname belongs
+    /// to. Absent means the default organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+
     /// Optional human-readable description.
     pub description: Option<String>,
 }
@@ -59,6 +71,11 @@ fleet_crd! {
     /// sub-ranges that are carved out for other uses (e.g. Multus macvlan).
     kind = "DhcpConfig",
     struct DhcpConfigSpec {
+    /// Organization whose DNS zone this DHCP scope advertises as its domain.
+    /// Absent means the default organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+
     /// First address in the dynamic DHCP range.
     pub range_start: String,
 
@@ -96,6 +113,12 @@ fleet_crd! {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct OidcApplicationSpec {
+    /// Zitadel organization holding the project. Absent means the default
+    /// organization, which is how every OidcApplication behaved before
+    /// organizations existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+
     /// Zitadel project name (resolved to project ID at runtime).
     pub project_name: String,
 

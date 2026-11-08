@@ -10,18 +10,21 @@ use crate::{error::Error, state::parse_duration};
 #[derive(Debug)]
 pub struct Config {
     pub cloudflare_api_token: String,
-    pub cloudflare_zone_id: String,
     pub opnsense_url: String,
     pub opnsense_api_key: String,
     pub opnsense_api_secret: String,
     pub default_reconcile_interval: Duration,
     pub default_dns_ttl: Duration,
     pub wan_interface: String,
-    pub cloudflare_cname_target: String,
     pub dry_run: bool,
 
-    /// DNS zone configuration (zone suffix + Unbound anchor hostname).
-    pub zones: Zones,
+    /// Organizations (tenants) this deployment manages. Always holds at least
+    /// the default organization, built from the DNS_ZONE / CLOUDFLARE_* vars.
+    pub orgs: Orgs,
+
+    /// Name of the Zitadel organization to treat as the default, i.e. the one
+    /// used by any CRD that names no organization.
+    pub default_org: String,
 
     // Optional: Zitadel OIDC management (all must be set to enable)
     pub zitadel_url: Option<String>,
@@ -30,51 +33,208 @@ pub struct Config {
     pub zitadel_private_key: Option<String>,
 }
 
-/// DNS zone configuration. Loaded from env so a deployment can manage its own
-/// zone without recompiling.
+/// A single organization (tenant): one Zitadel org paired with one DNS zone.
 ///
-/// - `zone` — the bare zone name (e.g. `example.com`), from `DNS_ZONE`.
-/// - `managed_zone` — the leading-dot suffix (`.example.com`). Derived from
-///   `zone` unless `DNS_MANAGED_ZONE` is set explicitly.
-/// - `unbound_anchor` — the Unbound anchor hostname that holds the Traefik
-///   macvlan A record; all IngressRoute hostnames become aliases of it. From
-///   `UNBOUND_ANCHOR`, defaulting to `ha.{zone}`.
+/// Every record fleet-dns writes belongs to exactly one organization. The
+/// organization is picked by DNS-zone suffix for hostnames, and by explicit
+/// `spec.org` / `hr-home.xyz/org` for resources that carry no hostname (OIDC
+/// applications, DHCP reservations).
+///
+/// - `name` — the Zitadel organization name, used as the tenant key in CRDs
+///   (e.g. `hr-home`, `quota-fitness`).
+/// - `zone` — the bare DNS zone (e.g. `quota.fitness`).
+/// - `managed_zone` — the leading-dot suffix (`.quota.fitness`).
+/// - `unbound_anchor` — the Unbound anchor hostname holding the Traefik
+///   macvlan A record; IngressRoute hostnames in this zone become aliases of
+///   it. Defaults to `ha.{zone}`.
+/// - `cloudflare_zone_id` — `None` disables Cloudflare for this organization;
+///   CoreDNS and Unbound still apply.
+/// - `cloudflare_cname_target` — hostname holding the WAN A record that
+///   service CNAMEs point at. Defaults to `origin.{zone}`.
+/// - `zitadel_org_id` — resolved Zitadel org ID, sent as `x-zitadel-orgid`.
+///   `None` means "the service account's default organization", which is what
+///   every Zitadel call used before organizations existed.
 #[derive(Debug, Clone)]
-pub struct Zones {
+pub struct Org {
+    pub name: String,
     pub zone: String,
     pub managed_zone: String,
     pub unbound_anchor: String,
+    pub cloudflare_zone_id: Option<String>,
+    pub cloudflare_cname_target: String,
+    pub zitadel_org_id: Option<String>,
 }
 
-impl Zones {
-    /// Load zone configuration from environment variables.
-    ///
-    /// Optional (with defaults):
-    /// - `DNS_ZONE` (default `"example.com"`)
-    /// - `DNS_MANAGED_ZONE` (default: `.{DNS_ZONE}`)
-    /// - `UNBOUND_ANCHOR` (default: `ha.{DNS_ZONE}`)
-    pub fn from_env() -> Self {
-        let zone = std::env::var("DNS_ZONE").unwrap_or_else(|_| "example.com".to_owned());
-        let managed_zone = std::env::var("DNS_MANAGED_ZONE").unwrap_or_else(|_| format!(".{zone}"));
-        let unbound_anchor =
-            std::env::var("UNBOUND_ANCHOR").unwrap_or_else(|_| format!("ha.{zone}"));
+impl Org {
+    /// Build an organization from a name and zone, filling the derived
+    /// defaults (`managed_zone`, `unbound_anchor`, `cloudflare_cname_target`).
+    #[must_use]
+    pub fn new(name: &str, zone: &str) -> Self {
         Self {
-            zone,
-            managed_zone,
-            unbound_anchor,
+            name: name.to_owned(),
+            zone: zone.to_owned(),
+            managed_zone: format!(".{zone}"),
+            unbound_anchor: format!("ha.{zone}"),
+            cloudflare_zone_id: None,
+            cloudflare_cname_target: format!("origin.{zone}"),
+            zitadel_org_id: None,
         }
     }
 
-    /// Fixed zone configuration used by unit tests. Mirrors the historical
+    /// True when `hostname` belongs to this organization's zone.
+    #[must_use]
+    pub fn owns_hostname(&self, hostname: &str) -> bool {
+        hostname.ends_with(self.managed_zone.as_str()) || hostname == self.zone
+    }
+
+    /// Fixed organization used by unit tests. Mirrors the historical
     /// compiled-in defaults so existing test fixtures keep their hostnames.
     #[cfg(test)]
     #[must_use]
     pub fn test() -> Self {
         Self {
+            name: "hr-home".to_owned(),
             zone: "hr-home.xyz".to_owned(),
             managed_zone: ".hr-home.xyz".to_owned(),
             unbound_anchor: "ha.hr-home.xyz".to_owned(),
+            cloudflare_zone_id: Some("zone-123".to_owned()),
+            cloudflare_cname_target: "origin.hr-home.xyz".to_owned(),
+            zitadel_org_id: None,
         }
+    }
+}
+
+/// The set of organizations fleet-dns manages, with one marked default.
+///
+/// The default organization is always present and always built from the
+/// `DNS_ZONE` / `CLOUDFLARE_*` environment variables, so a deployment that
+/// names no organization anywhere behaves exactly as it did before
+/// organizations existed. Additional organizations are discovered from Zitadel
+/// at startup (see `Orgs::extend`).
+#[derive(Debug, Clone)]
+pub struct Orgs {
+    orgs: Vec<Org>,
+    default_name: String,
+}
+
+impl Orgs {
+    /// Build a registry holding a single default organization.
+    #[must_use]
+    pub fn single(org: Org) -> Self {
+        let default_name = org.name.clone();
+        Self {
+            orgs: vec![org],
+            default_name,
+        }
+    }
+
+    /// Record the resolved Zitadel organization ID for an existing entry.
+    pub fn set_zitadel_org_id(&mut self, name: &str, org_id: &str) {
+        if let Some(org) = self.orgs.iter_mut().find(|o| o.name == name) {
+            org.zitadel_org_id = Some(org_id.to_owned());
+        }
+    }
+
+    /// Add organizations discovered at runtime. An entry whose name matches an
+    /// organization already present is ignored, so the env-configured default
+    /// always wins over anything discovered later.
+    pub fn extend(&mut self, discovered: impl IntoIterator<Item = Org>) {
+        for org in discovered {
+            if self.by_name(&org.name).is_none() {
+                self.orgs.push(org);
+            }
+        }
+    }
+
+    /// The default organization, used whenever no organization is named.
+    ///
+    /// # Panics
+    /// Never: the registry is constructed with at least one organization and
+    /// `default_name` always refers to it.
+    #[must_use]
+    pub fn default_org(&self) -> &Org {
+        self.orgs
+            .iter()
+            .find(|o| o.name == self.default_name)
+            .unwrap_or_else(|| {
+                // Unreachable by construction; fall back to the first entry
+                // rather than panicking in a reconcile loop.
+                &self.orgs[0]
+            })
+    }
+
+    /// Look up an organization by name.
+    #[must_use]
+    pub fn by_name(&self, name: &str) -> Option<&Org> {
+        self.orgs.iter().find(|o| o.name == name)
+    }
+
+    /// Resolve an optional organization name to an organization, falling back
+    /// to the default. Returns `None` when a name is given but unknown, so
+    /// callers can warn and skip rather than write to the wrong tenant.
+    #[must_use]
+    pub fn resolve(&self, name: Option<&str>) -> Option<&Org> {
+        match name {
+            None => Some(self.default_org()),
+            Some(n) => self.by_name(n),
+        }
+    }
+
+    /// Find the organization owning `hostname`, matching the most specific
+    /// (longest) zone suffix so a zone nested inside another still resolves to
+    /// the inner one.
+    #[must_use]
+    pub fn for_hostname(&self, hostname: &str) -> Option<&Org> {
+        self.orgs
+            .iter()
+            .filter(|o| o.owns_hostname(hostname))
+            .max_by_key(|o| o.zone.len())
+    }
+
+    /// Iterate every organization, default first.
+    pub fn iter(&self) -> impl Iterator<Item = &Org> {
+        let default = self.default_org();
+        std::iter::once(default).chain(self.orgs.iter().filter(move |o| o.name != default.name))
+    }
+
+    /// Number of organizations in the registry.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.orgs.len()
+    }
+
+    /// Always false: the registry holds at least the default organization.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Load the default organization from environment variables.
+    ///
+    /// Optional (with defaults):
+    /// - `ORG_NAME` (default `"hr-home"`) — the default organization's name
+    /// - `DNS_ZONE` (default `"example.com"`)
+    /// - `DNS_MANAGED_ZONE` (default: `.{DNS_ZONE}`)
+    /// - `UNBOUND_ANCHOR` (default: `ha.{DNS_ZONE}`)
+    /// - `CLOUDFLARE_CNAME_TARGET` (default: `origin.{DNS_ZONE}`)
+    /// - `ORG_NAME` (default `"hr-home"`) — name of the default organization
+    pub fn from_env(cloudflare_zone_id: String) -> Self {
+        let name = std::env::var("ORG_NAME").unwrap_or_else(|_| "hr-home".to_owned());
+        let zone = std::env::var("DNS_ZONE").unwrap_or_else(|_| "example.com".to_owned());
+
+        let mut org = Org::new(&name, &zone);
+        if let Ok(managed) = std::env::var("DNS_MANAGED_ZONE") {
+            org.managed_zone = managed;
+        }
+        if let Ok(anchor) = std::env::var("UNBOUND_ANCHOR") {
+            org.unbound_anchor = anchor;
+        }
+        if let Ok(target) = std::env::var("CLOUDFLARE_CNAME_TARGET") {
+            org.cloudflare_cname_target = target;
+        }
+        org.cloudflare_zone_id = Some(cloudflare_zone_id);
+
+        Self::single(org)
     }
 }
 
@@ -97,11 +257,12 @@ impl Config {
     /// - `DNS_MANAGED_ZONE` (default: `.{DNS_ZONE}`)
     /// - `UNBOUND_ANCHOR` (default: `ha.{DNS_ZONE}`)
     /// - `CLOUDFLARE_CNAME_TARGET` (default: `origin.{DNS_ZONE}`)
+    /// - `ORG_NAME` (default `"hr-home"`) — name of the default organization
     pub fn from_env() -> Result<Self, Error> {
-        let zones = Zones::from_env();
-        let zone = zones.zone.clone();
         let cloudflare_api_token = require_env("CLOUDFLARE_API_TOKEN")?;
         let cloudflare_zone_id = require_env("CLOUDFLARE_ZONE_ID")?;
+        let orgs = Orgs::from_env(cloudflare_zone_id);
+        let default_org = orgs.default_org().name.clone();
         let opnsense_url = require_env("OPNSENSE_URL")?;
         let opnsense_api_key = read_secret("OPNSENSE_API_KEY")?;
         let opnsense_api_secret = read_secret("OPNSENSE_API_SECRET")?;
@@ -112,9 +273,6 @@ impl Config {
         let default_dns_ttl = optional_duration("DEFAULT_DNS_TTL", Duration::from_secs(300))?;
 
         let wan_interface = std::env::var("WAN_INTERFACE").unwrap_or_else(|_| "wan".to_owned());
-
-        let cloudflare_cname_target =
-            std::env::var("CLOUDFLARE_CNAME_TARGET").unwrap_or_else(|_| format!("origin.{zone}"));
 
         let dry_run = std::env::var("DRY_RUN")
             .map(|v| v == "true" || v == "1")
@@ -128,16 +286,15 @@ impl Config {
 
         Ok(Self {
             cloudflare_api_token,
-            cloudflare_zone_id,
             opnsense_url,
             opnsense_api_key,
             opnsense_api_secret,
             default_reconcile_interval,
             default_dns_ttl,
             wan_interface,
-            cloudflare_cname_target,
             dry_run,
-            zones,
+            orgs,
+            default_org,
             zitadel_url,
             zitadel_key_id,
             zitadel_user_id,
@@ -220,7 +377,11 @@ mod tests {
         with_env(&base_env(), || {
             let config = Config::from_env().expect("should succeed");
             assert_eq!(config.cloudflare_api_token, "cf-token");
-            assert_eq!(config.cloudflare_zone_id, "zone-123");
+            assert_eq!(
+                config.orgs.default_org().cloudflare_zone_id.as_deref(),
+                Some("zone-123")
+            );
+            assert_eq!(config.default_org, "hr-home");
             assert_eq!(config.opnsense_url, "https://opnsense.local");
             assert_eq!(config.opnsense_api_key, "key");
             assert_eq!(config.opnsense_api_secret, "secret");

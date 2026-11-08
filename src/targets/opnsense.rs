@@ -1,14 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::ReconcileStats;
 use crate::crd::DhcpConfigSpec;
 use crate::error::Error;
 use crate::state::{DnsEntry, Protocol, WanExpose};
-use crate::{ReconcileStats, Zones};
 
 /// Marker prefix embedded in OPNsense descriptions to identify fleet-dns-managed entries.
 const MARKER_PREFIX: &str = "[fleet-dns:";
@@ -304,6 +304,36 @@ struct DnsmasqRangePayload {
     range: DnsmasqRangeData,
 }
 
+/// The DHCP scope fields fleet-dns writes, shared by create and update.
+///
+/// `zone` is the organization's DNS zone, advertised to clients as the scope's
+/// domain.
+#[derive(Debug, Clone, Copy)]
+pub struct DnsmasqRangeSpec<'a> {
+    pub start: &'a str,
+    pub end: &'a str,
+    pub interface: &'a str,
+    pub lease_time: &'a str,
+    pub description: &'a str,
+    pub zone: &'a str,
+}
+
+impl DnsmasqRangeSpec<'_> {
+    /// Build the OPNsense request body for this range.
+    fn payload(&self) -> DnsmasqRangePayload {
+        DnsmasqRangePayload {
+            range: DnsmasqRangeData {
+                interface: self.interface.to_owned(),
+                start_addr: self.start.to_owned(),
+                end_addr: self.end.to_owned(),
+                lease_time: self.lease_time.to_owned(),
+                domain: self.zone.to_owned(),
+                description: self.description.to_owned(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DnsmasqRangeData {
     interface: String,
@@ -423,6 +453,8 @@ pub struct DhcpHostEntry {
     pub hostname: String,
     pub ip: String,
     pub mac: String,
+    /// DNS zone of the organization owning this reservation.
+    pub zone: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -465,18 +497,12 @@ pub struct OpnSenseClient {
     base_url: String,
     api_key: String,
     api_secret: String,
-    zones: Zones,
 }
 
 impl OpnSenseClient {
     /// Create a client with HTTP Basic Auth and TLS verification disabled
     /// (OPNsense typically uses a self-signed certificate).
-    pub fn new(
-        base_url: &str,
-        api_key: &str,
-        api_secret: &str,
-        zones: &Zones,
-    ) -> Result<Self, Error> {
+    pub fn new(base_url: &str, api_key: &str, api_secret: &str) -> Result<Self, Error> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
@@ -487,7 +513,6 @@ impl OpnSenseClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
             api_secret: api_secret.to_owned(),
-            zones: zones.clone(),
         })
     }
 
@@ -810,71 +835,83 @@ impl OpnSenseClient {
         }
 
         // -- Phase 2: host aliases --
-        // Find the anchor override UUID (needed as parent for all aliases).
-        // Re-fetch overrides if we just created the anchor in Phase 1.
-        let anchor_uuid =
-            if let Some(existing) = existing_by_marker.get(self.zones.unbound_anchor.as_str()) {
-                Some(existing.uuid.clone())
-            } else if !dry_run {
-                // Anchor was just created — re-fetch to get its UUID.
-                let refreshed = self.search_host_overrides().await?;
-                refreshed
-                    .iter()
-                    .find(|o| {
-                        extract_marker_payload(&o.description)
-                            == Some(self.zones.unbound_anchor.as_str())
-                    })
+        // Each alias parents on the anchor named by its own entry, so entries
+        // belonging to different organizations attach to different anchors.
+        // Re-fetch overrides once if any wanted anchor was created in Phase 1.
+        let wanted_anchors: BTreeSet<&str> = alias_entries
+            .iter()
+            .filter_map(|e| e.unbound_alias_target.as_deref())
+            .collect();
+
+        let refreshed = if !dry_run
+            && wanted_anchors
+                .iter()
+                .any(|a| !existing_by_marker.contains_key(*a))
+        {
+            self.search_host_overrides().await?
+        } else {
+            Vec::new()
+        };
+
+        // anchor hostname -> override UUID the aliases parent on.
+        let anchor_uuids: HashMap<&str, String> = wanted_anchors
+            .iter()
+            .filter_map(|anchor| {
+                existing_by_marker
+                    .get(*anchor)
                     .map(|o| o.uuid.clone())
-            } else {
-                None
+                    .or_else(|| {
+                        refreshed
+                            .iter()
+                            .find(|o| extract_marker_payload(&o.description) == Some(*anchor))
+                            .map(|o| o.uuid.clone())
+                    })
+                    .map(|uuid| (*anchor, uuid))
+            })
+            .collect();
+
+        for entry in &alias_entries {
+            let Some(anchor) = entry.unbound_alias_target.as_deref() else {
+                continue;
+            };
+            let Some(parent_uuid) = anchor_uuids.get(anchor) else {
+                warn!(
+                    hostname = %entry.hostname,
+                    anchor,
+                    "anchor override not found; skipping alias entry"
+                );
+                stats.skipped += 1;
+                continue;
             };
 
-        if !alias_entries.is_empty() {
-            match &anchor_uuid {
-                Some(parent_uuid) => {
-                    for entry in &alias_entries {
-                        let (host, domain) = split_hostname(&entry.hostname);
-                        let marker = unbound_marker(&entry.hostname);
+            let (host, domain) = split_hostname(&entry.hostname);
+            let marker = unbound_marker(&entry.hostname);
 
-                        accounted_aliases.insert(entry.hostname.clone());
+            accounted_aliases.insert(entry.hostname.clone());
 
-                        match aliases_by_marker.get(entry.hostname.as_str()) {
-                            Some(_existing_alias) => {
-                                // Alias exists — host aliases don't have an IP to
-                                // compare, so as long as it exists we're good.
-                                debug!(
-                                    hostname = %entry.hostname,
-                                    "Unbound host alias unchanged"
-                                );
-                            }
-                            None => {
-                                if dry_run {
-                                    info!(
-                                        hostname = %entry.hostname,
-                                        anchor = self.zones.unbound_anchor.as_str(),
-                                        "[dry-run] would create Unbound host alias"
-                                    );
-                                } else {
-                                    self.add_host_alias(parent_uuid, host, domain, &marker)
-                                        .await?;
-                                    info!(
-                                        hostname = %entry.hostname,
-                                        anchor = self.zones.unbound_anchor.as_str(),
-                                        "created Unbound host alias"
-                                    );
-                                }
-                                stats.created += 1;
-                            }
-                        }
-                    }
+            match aliases_by_marker.get(entry.hostname.as_str()) {
+                Some(_existing_alias) => {
+                    // Alias exists — host aliases don't have an IP to
+                    // compare, so as long as it exists we're good.
+                    debug!(hostname = %entry.hostname, "Unbound host alias unchanged");
                 }
                 None => {
-                    warn!(
-                        "anchor override {} not found; skipping {} alias entries",
-                        self.zones.unbound_anchor,
-                        alias_entries.len()
-                    );
-                    stats.skipped += alias_entries.len() as u32;
+                    if dry_run {
+                        info!(
+                            hostname = %entry.hostname,
+                            anchor,
+                            "[dry-run] would create Unbound host alias"
+                        );
+                    } else {
+                        self.add_host_alias(parent_uuid, host, domain, &marker)
+                            .await?;
+                        info!(
+                            hostname = %entry.hostname,
+                            anchor,
+                            "created Unbound host alias"
+                        );
+                    }
+                    stats.created += 1;
                 }
             }
         }
@@ -1042,7 +1079,8 @@ impl OpnSenseClient {
     /// Reconcile Dnsmasq DHCP host reservations to match desired entries.
     ///
     /// Each entry produces a reservation with marker `[fleet-dns:dhcp:{hostname}]`.
-    /// Domain is always `hr-home.xyz`.
+    /// A bare hostname is qualified into the zone carried on the entry, which
+    /// comes from the reservation's organization.
     pub async fn reconcile_dnsmasq_hosts(
         &self,
         reservations: &[DhcpHostEntry],
@@ -1061,7 +1099,7 @@ impl OpnSenseClient {
 
         for entry in reservations {
             let marker = dnsmasq_host_marker(&entry.hostname);
-            let (host, domain) = dhcp_host_domain(&entry.hostname, &self.zones.zone);
+            let (host, domain) = dhcp_host_domain(&entry.hostname, &entry.zone);
 
             accounted.insert(&entry.hostname);
 
@@ -1188,51 +1226,24 @@ impl OpnSenseClient {
     }
 
     /// Create a new Dnsmasq DHCP range.
-    pub async fn add_dnsmasq_range(
-        &self,
-        start: &str,
-        end: &str,
-        interface: &str,
-        lease_time: &str,
-        description: &str,
-    ) -> Result<(), Error> {
-        let body = DnsmasqRangePayload {
-            range: DnsmasqRangeData {
-                interface: interface.to_owned(),
-                start_addr: start.to_owned(),
-                end_addr: end.to_owned(),
-                lease_time: lease_time.to_owned(),
-                domain: self.zones.zone.clone(),
-                description: description.to_owned(),
-            },
-        };
-        self.post_json_ok("/api/dnsmasq/settings/addRange", &body, "addRange")
-            .await
+    pub async fn add_dnsmasq_range(&self, range: &DnsmasqRangeSpec<'_>) -> Result<(), Error> {
+        self.post_json_ok(
+            "/api/dnsmasq/settings/addRange",
+            &range.payload(),
+            "addRange",
+        )
+        .await
     }
 
     /// Update an existing Dnsmasq DHCP range by UUID.
     pub async fn set_dnsmasq_range(
         &self,
         uuid: &str,
-        start: &str,
-        end: &str,
-        interface: &str,
-        lease_time: &str,
-        description: &str,
+        range: &DnsmasqRangeSpec<'_>,
     ) -> Result<(), Error> {
-        let body = DnsmasqRangePayload {
-            range: DnsmasqRangeData {
-                interface: interface.to_owned(),
-                start_addr: start.to_owned(),
-                end_addr: end.to_owned(),
-                lease_time: lease_time.to_owned(),
-                domain: self.zones.zone.clone(),
-                description: description.to_owned(),
-            },
-        };
         self.post_json_ok(
             &format!("/api/dnsmasq/settings/setRange/{uuid}"),
-            &body,
+            &range.payload(),
             &format!("setRange({uuid})"),
         )
         .await
@@ -1246,6 +1257,7 @@ impl OpnSenseClient {
     pub async fn reconcile_dnsmasq_range(
         &self,
         config: &DhcpConfigSpec,
+        zone: &str,
         dry_run: bool,
     ) -> Result<ReconcileStats, Error> {
         let existing = self.search_dnsmasq_ranges().await?;
@@ -1262,6 +1274,15 @@ impl OpnSenseClient {
         // Default interface for the LAN DHCP scope.
         let interface = "lan";
 
+        let range_spec = DnsmasqRangeSpec {
+            start: &config.range_start,
+            end: &config.range_end,
+            interface,
+            lease_time: &lease_time,
+            description: &marker,
+            zone,
+        };
+
         match managed {
             Some(range) => {
                 let start_changed = range.start_addr != config.range_start;
@@ -1277,15 +1298,7 @@ impl OpnSenseClient {
                             "[dry-run] would update Dnsmasq DHCP range"
                         );
                     } else {
-                        self.set_dnsmasq_range(
-                            &range.uuid,
-                            &config.range_start,
-                            &config.range_end,
-                            interface,
-                            &lease_time,
-                            &marker,
-                        )
-                        .await?;
+                        self.set_dnsmasq_range(&range.uuid, &range_spec).await?;
                         info!(
                             start = %config.range_start,
                             end = %config.range_end,
@@ -1306,14 +1319,7 @@ impl OpnSenseClient {
                         "[dry-run] would create Dnsmasq DHCP range"
                     );
                 } else {
-                    self.add_dnsmasq_range(
-                        &config.range_start,
-                        &config.range_end,
-                        interface,
-                        &lease_time,
-                        &marker,
-                    )
-                    .await?;
+                    self.add_dnsmasq_range(&range_spec).await?;
                     info!(
                         start = %config.range_start,
                         end = %config.range_end,
@@ -1937,7 +1943,7 @@ mod tests {
 
     #[test]
     fn dhcp_host_domain_bare_hostname_uses_zone() {
-        let z = Zones::test();
+        let z = crate::Org::test();
         assert_eq!(
             dhcp_host_domain("kitchen-sensor", &z.zone),
             ("kitchen-sensor", z.zone.as_str())
@@ -1946,7 +1952,7 @@ mod tests {
 
     #[test]
     fn dhcp_host_domain_fqdn_splits() {
-        let z = Zones::test();
+        let z = crate::Org::test();
         assert_eq!(
             dhcp_host_domain("plex.hr-home.xyz", &z.zone),
             ("plex", "hr-home.xyz")

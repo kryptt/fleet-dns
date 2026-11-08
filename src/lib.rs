@@ -12,7 +12,7 @@ pub mod state;
 pub mod targets;
 pub mod traefik;
 
-pub use config::Zones;
+pub use config::{Org, Orgs};
 
 /// Statistics from a single reconciliation pass against any target.
 #[derive(Debug, Default)]

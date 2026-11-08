@@ -54,6 +54,12 @@ pub struct Config {
 /// - `zitadel_org_id` — resolved Zitadel org ID, sent as `x-zitadel-orgid`.
 ///   `None` means "the service account's default organization", which is what
 ///   every Zitadel call used before organizations existed.
+/// - `manage_dns` — whether fleet-dns writes DNS for this zone. When false the
+///   organization is registry-only: usable for OIDC and for qualifying DHCP
+///   hostnames, but its zone is invisible to every DNS target, so hostnames in
+///   it are ignored rather than reconciled. False is the safe default, because
+///   managing a zone also means orphan-deleting records in it that fleet-dns
+///   did not create.
 #[derive(Debug, Clone)]
 pub struct Org {
     pub name: String,
@@ -63,6 +69,7 @@ pub struct Org {
     pub cloudflare_zone_id: Option<String>,
     pub cloudflare_cname_target: String,
     pub zitadel_org_id: Option<String>,
+    pub manage_dns: bool,
 }
 
 impl Org {
@@ -78,10 +85,15 @@ impl Org {
             cloudflare_zone_id: None,
             cloudflare_cname_target: format!("origin.{zone}"),
             zitadel_org_id: None,
+            manage_dns: false,
         }
     }
 
     /// True when `hostname` belongs to this organization's zone.
+    ///
+    /// Zone membership only; it does not imply fleet-dns manages the record.
+    /// Callers that write DNS must also check [`Self::manage_dns`], or go
+    /// through [`Orgs::for_hostname`], which filters on it.
     #[must_use]
     pub fn owns_hostname(&self, hostname: &str) -> bool {
         hostname.ends_with(self.managed_zone.as_str()) || hostname == self.zone
@@ -100,6 +112,7 @@ impl Org {
             cloudflare_zone_id: Some("zone-123".to_owned()),
             cloudflare_cname_target: "origin.hr-home.xyz".to_owned(),
             zitadel_org_id: None,
+            manage_dns: true,
         }
     }
 }
@@ -196,15 +209,27 @@ impl Orgs {
         }
     }
 
-    /// Find the organization owning `hostname`, matching the most specific
-    /// (longest) zone suffix so a zone nested inside another still resolves to
-    /// the inner one.
+    /// Find the DNS-managing organization owning `hostname`, matching the most
+    /// specific (longest) zone suffix so a zone nested inside another still
+    /// resolves to the inner one.
+    ///
+    /// Organizations with `manage_dns == false` are skipped, so a hostname in
+    /// a registered-but-unmanaged zone resolves to nothing and is ignored by
+    /// every DNS target — the same treatment an unknown zone gets.
     #[must_use]
     pub fn for_hostname(&self, hostname: &str) -> Option<&Org> {
         self.orgs
             .iter()
-            .filter(|o| o.owns_hostname(hostname))
+            .filter(|o| o.manage_dns && o.owns_hostname(hostname))
             .max_by_key(|o| o.zone.len())
+    }
+
+    /// Iterate the organizations whose DNS fleet-dns manages.
+    pub fn dns_managed(&self) -> impl Iterator<Item = &Org> {
+        let default = self.default_org().name.clone();
+        self.orgs
+            .iter()
+            .filter(move |o| o.manage_dns || o.name == default)
     }
 
     /// Iterate every organization, default first.
@@ -249,6 +274,8 @@ impl Orgs {
             org.cloudflare_cname_target = target;
         }
         org.cloudflare_zone_id = Some(cloudflare_zone_id);
+        // The deployment's own zone, configured by hand: always managed.
+        org.manage_dns = true;
 
         Self::single(org)
     }

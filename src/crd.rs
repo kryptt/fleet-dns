@@ -97,6 +97,56 @@ fleet_crd! {
 }
 }
 
+fleet_crd! {
+    /// Spec for an Organization custom resource.
+    ///
+    /// Declares a tenant: a Zitadel organization paired with a DNS zone. This
+    /// repo is the source of truth — fleet-dns manages an organization only
+    /// when an Organization resource declares it, never because one happens to
+    /// exist in Zitadel.
+    kind = "Organization",
+    struct OrganizationSpec {
+    /// DNS zone this organization owns (e.g. "quota.fitness").
+    pub zone: String,
+
+    /// Zitadel organization name. Defaults to the resource's own name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
+
+    /// Write DNS records for this zone — CoreDNS, Unbound, Cloudflare and WAN
+    /// forwards.
+    ///
+    /// Defaults to **false**: declaring an organization registers it for OIDC
+    /// and for qualifying DHCP hostnames, but does not hand fleet-dns its DNS.
+    /// Turning this on makes fleet-dns authoritative for the zone, which means
+    /// records in it that fleet-dns does not know about become orphans and are
+    /// deleted. Only enable it for a zone whose records are not hand-managed,
+    /// and check for conflicts first.
+    #[serde(default)]
+    pub manage_dns: bool,
+
+    /// Create the organization in Zitadel when no organization of this name
+    /// exists. Defaults to true.
+    #[serde(default = "crate::crd::default_true")]
+    pub create: bool,
+
+    /// Cloudflare zone ID. Resolved from `zone` by name when absent; absent
+    /// and unresolvable means no Cloudflare records for this organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare_zone_id: Option<String>,
+
+    /// Hostname holding the WAN A record that service CNAMEs point at.
+    /// Defaults to `origin.{zone}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare_cname_target: Option<String>,
+
+    /// Unbound anchor hostname that IngressRoute hostnames in this zone alias.
+    /// Defaults to `ha.{zone}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbound_anchor: Option<String>,
+}
+}
+
 /// Spec for an OidcApplication custom resource.
 ///
 /// Declares a Zitadel OIDC application and its corresponding Traefik
@@ -177,7 +227,7 @@ pub struct OidcMiddlewareSpec {
     pub authorization_header: bool,
 }
 
-fn default_true() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }
 

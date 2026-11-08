@@ -36,95 +36,6 @@ fn build_clients(config: &Config) -> Result<(CloudflareClient, OpnSenseClient), 
     Ok((cloudflare, opnsense))
 }
 
-/// Discover additional organizations from Zitadel and add them to `orgs`.
-///
-/// Each Zitadel organization becomes a tenant whose DNS zone is its `dnsZone`
-/// org metadata value, falling back to its Zitadel primary domain. An
-/// organization whose zone cannot be resolved to a Cloudflare zone still gets
-/// CoreDNS and Unbound records, just no Cloudflare ones.
-///
-/// Resolution happens once at startup. Adding an organization in Zitadel
-/// therefore needs a fleet-dns restart to take effect, which keeps the
-/// reconcile loop free of extra API calls.
-///
-/// Failures here are logged and ignored: the default organization is already
-/// in the registry, so fleet-dns keeps working exactly as it did before.
-async fn discover_orgs(
-    zitadel: &fleet_dns::targets::zitadel::ZitadelClient,
-    cloudflare: &CloudflareClient,
-    orgs: &mut fleet_dns::Orgs,
-    default_org: &str,
-) {
-    let listed = match zitadel.list_orgs().await {
-        Ok(listed) => listed,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "could not list Zitadel organizations; continuing with the default organization only"
-            );
-            return;
-        }
-    };
-
-    let mut discovered = Vec::new();
-
-    for org in listed {
-        // The default organization is configured from the environment and
-        // must not be redefined by discovery; just record its Zitadel ID.
-        if org.name == default_org {
-            orgs.set_zitadel_org_id(&org.name, &org.id);
-            continue;
-        }
-
-        let metadata_zone = match zitadel.org_metadata(&org.id, "dnsZone").await {
-            Ok(zone) => zone,
-            Err(e) => {
-                warn!(org = %org.name, error = %e, "could not read org metadata; using primary domain");
-                None
-            }
-        };
-
-        let Some(zone) =
-            fleet_dns::config::org_zone(metadata_zone.as_deref(), org.primary_domain.as_deref())
-        else {
-            warn!(
-                org = %org.name,
-                "organization has neither a dnsZone metadata value nor a primary domain; skipping"
-            );
-            continue;
-        };
-
-        let mut tenant = fleet_dns::Org::new(&org.name, &zone);
-        tenant.zitadel_org_id = Some(org.id.clone());
-        tenant.cloudflare_zone_id = match cloudflare.find_zone_id(&zone).await {
-            Ok(Some(id)) => Some(id),
-            Ok(None) => {
-                info!(
-                    org = %org.name,
-                    zone = %zone,
-                    "no Cloudflare zone for this organization; CoreDNS and Unbound only"
-                );
-                None
-            }
-            Err(e) => {
-                warn!(org = %org.name, zone = %zone, error = %e, "Cloudflare zone lookup failed; CoreDNS and Unbound only");
-                None
-            }
-        };
-
-        info!(
-            org = %org.name,
-            zone = %zone,
-            zitadel_org_id = %org.id,
-            cloudflare = tenant.cloudflare_zone_id.is_some(),
-            "discovered organization"
-        );
-        discovered.push(tenant);
-    }
-
-    orgs.extend(discovered);
-}
-
 /// Spawn a watch-driver future, treating its completion as fatal.
 ///
 /// The driver futures from `discovery::*::start_watcher` are expected to run
@@ -152,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("fleet-dns starting");
 
     // 2. Load config.
-    let mut config = Config::from_env()?;
+    let config = Config::from_env()?;
 
     // 3. Check for "cleanup" subcommand.
     let args: Vec<String> = std::env::args().collect();
@@ -197,6 +108,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_critical("dhcpreservation", reservation_handle);
     spawn_critical("dhcpconfig", dhcp_config_handle);
 
+    let (org_store, org_handle) = discovery::start_watcher::<fleet_dns::crd::Organization>(
+        kube_client.clone(),
+        "organization",
+    );
+    spawn_critical("organization", org_handle);
+
     // 8. Build target clients.
     let (cloudflare, opnsense) = build_clients(&config)?;
 
@@ -219,16 +136,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "oidcapplication",
             );
             spawn_critical("oidcapplication", handle);
-
-            // Organizations come from Zitadel, so discovery needs this client.
-            let default_org = config.default_org.clone();
-            discover_orgs(&client, &cloudflare, &mut config.orgs, &default_org).await;
-            info!(
-                organizations = config.orgs.len(),
-                default = %default_org,
-                "organization registry ready"
-            );
-
             (Some(client), Some(store))
         }
         _ => {
@@ -253,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reservation_store.clone(),
         policy_store.clone(),
         oidc_store,
+        org_store.clone(),
     ));
 
     // 10. Start HTTP server.

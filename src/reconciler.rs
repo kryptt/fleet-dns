@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use crate::ReconcileStats;
 use crate::config::Config;
-use crate::crd::{CoreDnsPolicy, DhcpConfig, DhcpReservation, OidcApplication};
+use crate::crd::{CoreDnsPolicy, DhcpConfig, DhcpReservation, OidcApplication, Organization};
 use crate::error::Error;
 use crate::metrics::{Metrics, error_label, target_label};
 use crate::oidc_state::{OidcAppDesired, build_oidc_desired};
@@ -40,6 +40,7 @@ pub struct Reconciler {
     dhcp_config_store: Store<DhcpConfig>,
     /// `None` when Zitadel OIDC management is disabled.
     oidc_store: Option<Store<OidcApplication>>,
+    org_store: Store<Organization>,
     // Infrastructure.
     config: Config,
     kube_client: Client,
@@ -65,6 +66,7 @@ impl Reconciler {
         reservation_store: Store<DhcpReservation>,
         policy_store: Store<CoreDnsPolicy>,
         oidc_store: Option<Store<OidcApplication>>,
+        org_store: Store<Organization>,
     ) -> Self {
         Self {
             cloudflare,
@@ -77,6 +79,7 @@ impl Reconciler {
             policy_store,
             reservation_store,
             oidc_store,
+            org_store,
             config,
             kube_client,
             metrics,
@@ -156,7 +159,152 @@ impl Reconciler {
         result
     }
 
+    /// Build the organization registry for this pass from the Organization
+    /// CRDs, on top of the env-configured default organization.
+    ///
+    /// This repo is the source of truth: an organization in Zitadel that no
+    /// Organization resource declares is not in the registry and is never
+    /// touched. Each declared organization is resolved to its Zitadel ID, is
+    /// created when absent and `spec.create` allows it, and has its `dnsZone`
+    /// metadata kept in step with `spec.zone`.
+    ///
+    /// Runs every pass rather than at startup, so adding an organization takes
+    /// effect on the next reconcile instead of needing a restart.
+    async fn build_orgs(&self) -> crate::Orgs {
+        let mut orgs = self.config.orgs.clone();
+        let declared = self.org_store.state();
+
+        if declared.is_empty() {
+            return orgs;
+        }
+
+        let Some(zitadel) = &self.zitadel else {
+            warn!(
+                count = declared.len(),
+                "Organization resources declared but Zitadel is not configured; ignoring them"
+            );
+            return orgs;
+        };
+
+        // One listing per pass, shared by every declared organization.
+        let existing = match zitadel.list_orgs().await {
+            Ok(existing) => existing,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "could not list Zitadel organizations; continuing with the default organization only"
+                );
+                return orgs;
+            }
+        };
+
+        let mut resolved = Vec::new();
+
+        for decl in &declared {
+            let res_name = decl.metadata.name.as_deref().unwrap_or_default();
+            let org_name = decl.spec.org_name.as_deref().unwrap_or(res_name);
+            if org_name.is_empty() {
+                warn!("Organization resource has no name; skipping");
+                continue;
+            }
+
+            let zitadel_id = match existing.iter().find(|o| o.name == org_name) {
+                Some(found) => Some(found.id.clone()),
+                None if decl.spec.create && !self.config.dry_run => {
+                    match zitadel.create_org(org_name).await {
+                        Ok(id) => {
+                            info!(org = org_name, id = %id, "created Zitadel organization");
+                            Some(id)
+                        }
+                        Err(e) => {
+                            warn!(org = org_name, error = %e, "failed to create Zitadel organization; skipping");
+                            continue;
+                        }
+                    }
+                }
+                None if decl.spec.create => {
+                    info!(
+                        org = org_name,
+                        "[dry-run] would create Zitadel organization"
+                    );
+                    None
+                }
+                None => {
+                    warn!(
+                        org = org_name,
+                        "Zitadel organization does not exist and spec.create is false; skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let mut org = crate::Org::new(org_name, &decl.spec.zone);
+            org.zitadel_org_id = zitadel_id.clone();
+            org.manage_dns = decl.spec.manage_dns;
+            if let Some(ref anchor) = decl.spec.unbound_anchor {
+                org.unbound_anchor = anchor.clone();
+            }
+            if let Some(ref target) = decl.spec.cloudflare_cname_target {
+                org.cloudflare_cname_target = target.clone();
+            }
+
+            // Cloudflare zone: explicit override, else resolved by name, and
+            // only needed when this organization's DNS is managed.
+            org.cloudflare_zone_id = match decl.spec.cloudflare_zone_id.clone() {
+                Some(id) => Some(id),
+                None if decl.spec.manage_dns => {
+                    match self.cloudflare.find_zone_id(&decl.spec.zone).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!(org = org_name, zone = %decl.spec.zone, error = %e, "Cloudflare zone lookup failed");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            // Keep the organization's declared zone visible in Zitadel, so the
+            // two systems agree on which zone belongs to which tenant.
+            if let Some(ref id) = zitadel_id
+                && !self.config.dry_run
+            {
+                match zitadel.org_metadata(id, "dnsZone").await {
+                    Ok(current) if current.as_deref() == Some(decl.spec.zone.as_str()) => {}
+                    Ok(_) => {
+                        if let Err(e) = zitadel
+                            .set_org_metadata(id, "dnsZone", &decl.spec.zone)
+                            .await
+                        {
+                            warn!(org = org_name, error = %e, "failed to set dnsZone org metadata");
+                        } else {
+                            info!(org = org_name, zone = %decl.spec.zone, "set dnsZone org metadata");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(org = org_name, error = %e, "could not read dnsZone org metadata")
+                    }
+                }
+            }
+
+            info!(
+                org = org_name,
+                zone = %decl.spec.zone,
+                manage_dns = decl.spec.manage_dns,
+                cloudflare = org.cloudflare_zone_id.is_some(),
+                "registered organization"
+            );
+            resolved.push(org);
+        }
+
+        orgs.extend(resolved);
+        orgs
+    }
+
     async fn reconcile_inner(&self) -> Result<(), Error> {
+        // 0. Organization registry for this pass, from the CRDs.
+        let orgs = self.build_orgs().await;
+
         // 1. Snapshot stores.
         let ingresses = self.ingress_store.state();
         let pods = self.pod_store.state();
@@ -167,13 +315,11 @@ impl Reconciler {
         let traefik_ip = find_traefik_ip(&pods)?;
 
         // 3. Build desired state.
-        let mut desired =
-            build_desired_state(&ingresses, &pods, &services, traefik_ip, &self.config.orgs);
+        let mut desired = build_desired_state(&ingresses, &pods, &services, traefik_ip, &orgs);
 
         // 3b. Merge DHCP reservations into DNS state.
         let reservations: Vec<_> = self.reservation_store.state();
-        let all_reservations =
-            merge_dhcp_reservations(&mut desired, &reservations, &self.config.orgs);
+        let all_reservations = merge_dhcp_reservations(&mut desired, &reservations, &orgs);
         let dhcp_configs: Vec<_> = self.dhcp_config_store.state();
 
         // 4. Get current WAN IP from OPNsense.
@@ -213,7 +359,7 @@ impl Reconciler {
                 self.kube_client.clone(),
                 &oidc_desired,
                 zitadel_url,
-                &self.config.orgs,
+                &orgs,
                 self.config.dry_run,
             )
             .await;
@@ -256,8 +402,7 @@ impl Reconciler {
         self.record_target_result("unbound", "opnsense_unbound", &unbound_result, false);
 
         // -- CoreDNS (internal, ALL entries unconditionally) --
-        let configmap_data =
-            coredns::render_configmap_data(&all_entries, &policies, &self.config.orgs);
+        let configmap_data = coredns::render_configmap_data(&all_entries, &policies, &orgs);
         if let Err(e) = coredns::apply_configmap(
             self.kube_client.clone(),
             configmap_data,
@@ -281,7 +426,7 @@ impl Reconciler {
         // One pass per organization: each writes only into its own zone, so a
         // failure in one organization cannot delete another's records.
         if nat_ok {
-            for org in self.config.orgs.iter() {
+            for org in orgs.dns_managed() {
                 let org_entries: Vec<_> = all_entries
                     .iter()
                     .filter(|e| e.org == org.name)
@@ -305,11 +450,9 @@ impl Reconciler {
                 hostname: r.spec.hostname.clone(),
                 ip: r.spec.ip.clone(),
                 mac: r.spec.mac.clone(),
-                zone: self
-                    .config
-                    .orgs
+                zone: orgs
                     .by_name(org_name)
-                    .unwrap_or_else(|| self.config.orgs.default_org())
+                    .unwrap_or_else(|| orgs.default_org())
                     .zone
                     .clone(),
             })
@@ -339,11 +482,9 @@ impl Reconciler {
                     .ip_conflicts_total
                     .inc_by(conflicts.len() as u64);
             } else {
-                let range_org = self
-                    .config
-                    .orgs
+                let range_org = orgs
                     .resolve(dhcp_config.spec.org.as_deref())
-                    .unwrap_or_else(|| self.config.orgs.default_org());
+                    .unwrap_or_else(|| orgs.default_org());
                 match self
                     .opnsense
                     .reconcile_dnsmasq_range(

@@ -1590,12 +1590,13 @@ wiki.hr-home.xyz lan=10.43.0.100 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed
     // Multi-organization behaviour
     // -----------------------------------------------------------------------
 
-    /// A registry holding hr-home (default) plus quota-fitness.
+    /// A registry holding hr-home (default) plus a DNS-managing quota-fitness.
     fn two_orgs() -> Orgs {
         let mut orgs = Orgs::single(Org::test());
         let mut quota = Org::new("quota-fitness", "quota.fitness");
         quota.cloudflare_zone_id = Some("zone-quota".to_owned());
         quota.zitadel_org_id = Some("398686617688080562".to_owned());
+        quota.manage_dns = true;
         orgs.extend([quota]);
         orgs
     }
@@ -1618,7 +1619,9 @@ wiki.hr-home.xyz lan=10.43.0.100 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed
     #[test]
     fn nested_zone_resolves_to_the_most_specific_organization() {
         let mut orgs = Orgs::single(Org::test());
-        orgs.extend([Org::new("sub", "sub.hr-home.xyz")]);
+        let mut sub = Org::new("sub", "sub.hr-home.xyz");
+        sub.manage_dns = true;
+        orgs.extend([sub]);
         assert_eq!(
             orgs.for_hostname("a.sub.hr-home.xyz").map(|o| &*o.name),
             Some("sub")
@@ -1737,5 +1740,52 @@ wiki.hr-home.xyz lan=10.43.0.100 mv=None cf=Skip wan=Skip ttl=300 iv=300 managed
         );
         let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &two_orgs());
         assert!(state.is_empty());
+    }
+    #[test]
+    fn registered_but_unmanaged_zone_is_invisible_to_dns() {
+        // The 2026-11-08 incident: organizations discovered from Zitadel were
+        // managed immediately, so IngressRoutes for fida.finance,
+        // constructive.dev and quota.fitness — zones whose records are
+        // hand-managed — were suddenly in scope. fleet-dns wrote 16 Unbound
+        // overrides and 3 Cloudflare records before erroring, and every
+        // uncommented record in those zones became a deletion candidate.
+        //
+        // An organization registered with manage_dns == false must be treated
+        // exactly like an unknown zone by every DNS path.
+        let mut orgs = Orgs::single(Org::test());
+        orgs.extend([Org::new("fida-finance", "fida.finance")]);
+
+        assert!(
+            orgs.for_hostname("mta-sts.fida.finance").is_none(),
+            "an unmanaged zone must not resolve to an organization"
+        );
+
+        let ir = make_ingress_route(
+            "system",
+            "stalwart",
+            "Host(`mta-sts.hr-home.xyz`) || Host(`mta-sts.fida.finance`)",
+            "stalwart",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+        let state = build_desired_state(&[ir], &[], &[], traefik_ip(), &orgs);
+
+        // Only the managed zone's hostname produced a record.
+        assert!(state.contains_key("mta-sts.hr-home.xyz"));
+        assert!(!state.contains_key("mta-sts.fida.finance"));
+        assert!(!state.contains_key("ha.fida.finance"), "no anchor either");
+
+        // And the organization is still usable for everything that is not DNS.
+        assert_eq!(
+            orgs.resolve(Some("fida-finance")).map(|o| &*o.name),
+            Some("fida-finance")
+        );
+    }
+
+    #[test]
+    fn dns_managed_always_includes_the_default_organization() {
+        let mut orgs = Orgs::single(Org::test());
+        orgs.extend([Org::new("fida-finance", "fida.finance")]);
+        let managed: Vec<&str> = orgs.dns_managed().map(|o| o.name.as_str()).collect();
+        assert_eq!(managed, vec!["hr-home"]);
     }
 }

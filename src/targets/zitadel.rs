@@ -91,6 +91,13 @@ struct OrgMetadata {
     value: Option<String>,
 }
 
+/// `POST /v2/organizations` response. The field is `organizationId` on v4.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateOrgResponse {
+    organization_id: String,
+}
+
 /// `POST /v2/organizations/{id}/metadata/search` response.
 #[derive(Debug, Deserialize)]
 struct OrgMetadataSearchResponse {
@@ -434,6 +441,41 @@ impl ZitadelClient {
 
         info!(count = resp.result.len(), "listed Zitadel organizations");
         Ok(resp.result)
+    }
+
+    /// Create an organization, returning its new ID.
+    ///
+    /// Requires an instance-level role carrying `org.create`
+    /// (e.g. IAM_ORG_MANAGER).
+    pub async fn create_org(&self, name: &str) -> Result<String, Error> {
+        let resp: CreateOrgResponse = self
+            .post_json(
+                "/v2/organizations",
+                &serde_json::json!({ "name": name }),
+                "create_org",
+                None,
+            )
+            .await?;
+        Ok(resp.organization_id)
+    }
+
+    /// Set one org-metadata value, base64-encoding it for the wire.
+    pub async fn set_org_metadata(
+        &self,
+        org_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), Error> {
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, value.as_bytes());
+        let path = format!("/v2/organizations/{org_id}/metadata");
+        let body = serde_json::json!({ "metadata": [{ "key": key, "value": encoded }] });
+
+        let req = self
+            .authed_request(reqwest::Method::POST, &path, None)
+            .await?
+            .json(&body);
+        self.send_checked(req, "set_org_metadata").await
     }
 
     /// Read one org-metadata value, decoding it from base64.

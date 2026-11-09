@@ -70,6 +70,8 @@ pub struct Org {
     pub cloudflare_cname_target: String,
     pub zitadel_org_id: Option<String>,
     pub manage_dns: bool,
+    /// Per-organization OIDC issuer (`Organization.spec.issuer`).
+    pub issuer: Option<String>,
 }
 
 impl Org {
@@ -86,6 +88,7 @@ impl Org {
             cloudflare_cname_target: format!("origin.{zone}"),
             zitadel_org_id: None,
             manage_dns: false,
+            issuer: None,
         }
     }
 
@@ -113,6 +116,7 @@ impl Org {
             cloudflare_cname_target: "origin.hr-home.xyz".to_owned(),
             zitadel_org_id: None,
             manage_dns: true,
+            issuer: None,
         }
     }
 }

@@ -109,6 +109,16 @@ fleet_crd! {
     /// DNS zone this organization owns (e.g. "quota.fitness").
     pub zone: String,
 
+    /// OIDC issuer for this organization's generated Middlewares, e.g.
+    /// `https://sso.quota.fitness` — a Zitadel instance custom domain that
+    /// serves this organization's login. When set, generated Middlewares use
+    /// it as `Provider.Url` and also request the scope
+    /// `urn:zitadel:iam:org:id:<org>`, because Zitadel picks the organization
+    /// from that scope, never from the hostname. Absent means the global
+    /// `ZITADEL_URL` and no organization scope (the pre-0.9 behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+
     /// Zitadel organization name. Defaults to the resource's own name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_name: Option<String>,

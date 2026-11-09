@@ -241,6 +241,7 @@ impl Reconciler {
             let mut org = crate::Org::new(org_name, &decl.spec.zone);
             org.zitadel_org_id = zitadel_id.clone();
             org.manage_dns = decl.spec.manage_dns;
+            org.issuer = decl.spec.issuer.clone();
             if let Some(ref anchor) = decl.spec.unbound_anchor {
                 org.unbound_anchor = anchor.clone();
             }
@@ -601,8 +602,8 @@ fn find_traefik_ip(pods: &[std::sync::Arc<Pod>]) -> Result<IpAddr, Error> {
 /// corresponding Zitadel app and Traefik Middleware, with up-to-date
 /// redirect URIs.
 ///
-/// `zitadel_url` is the issuer URL embedded in generated Middlewares,
-/// sourced from `Config.zitadel_url` (env `ZITADEL_URL`).
+/// `zitadel_url` (env `ZITADEL_URL`) is the issuer embedded in generated
+/// Middlewares unless the app's organization declares its own `issuer`.
 async fn reconcile_oidc(
     zitadel: &ZitadelClient,
     kube: Client,
@@ -628,6 +629,7 @@ async fn reconcile_oidc(
             continue;
         };
         let org_id = org.zitadel_org_id.as_deref();
+        let provider = OidcProvider::for_org(org, zitadel_url);
 
         // Resolve project ID from name, within that organization.
         let project_id = match zitadel
@@ -711,7 +713,7 @@ async fn reconcile_oidc(
                         &project_id,
                         org_id,
                         dry_run,
-                        zitadel_url,
+                        &provider,
                     )
                     .await?;
                 } else {
@@ -740,7 +742,7 @@ async fn reconcile_oidc(
                         &project_id,
                         org_id,
                         dry_run,
-                        zitadel_url,
+                        &provider,
                     )
                     .await?;
                     info!(
@@ -844,6 +846,48 @@ async fn reconcile_oidc(
     Ok(stats)
 }
 
+/// Issuer and organization scope for one organization's generated Middlewares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OidcProvider {
+    /// `Provider.Url` written into the Middleware.
+    pub url: String,
+    /// `urn:zitadel:iam:org:id:<id>`, requested in addition to the spec's
+    /// scopes so Zitadel shows this organization's login.
+    pub org_scope: Option<String>,
+}
+
+impl OidcProvider {
+    /// An organization with its own `issuer` gets that issuer plus its
+    /// organization scope; every other organization keeps the global
+    /// `ZITADEL_URL` and no extra scope, so existing Middlewares are unchanged.
+    pub(crate) fn for_org(org: &crate::Org, zitadel_url: &str) -> Self {
+        match org.issuer.as_deref() {
+            Some(issuer) => Self {
+                url: issuer.trim_end_matches('/').to_owned(),
+                org_scope: org
+                    .zitadel_org_id
+                    .as_deref()
+                    .map(|id| format!("urn:zitadel:iam:org:id:{id}")),
+            },
+            None => Self {
+                url: zitadel_url.to_owned(),
+                org_scope: None,
+            },
+        }
+    }
+
+    /// The spec's scopes with the organization scope appended once.
+    pub(crate) fn scopes(&self, base: &[String]) -> Vec<String> {
+        let mut out = base.to_vec();
+        if let Some(scope) = &self.org_scope
+            && !out.iter().any(|s| s == scope)
+        {
+            out.push(scope.clone());
+        }
+        out
+    }
+}
+
 /// Create or update a Traefik Middleware resource for an OIDC application.
 ///
 /// Uses server-side apply so that fleet-dns owns the resource without
@@ -855,7 +899,7 @@ async fn ensure_middleware(
     project_id: &str,
     org_id: Option<&str>,
     dry_run: bool,
-    zitadel_url: &str,
+    provider: &OidcProvider,
 ) -> Result<(), Error> {
     let mw = &spec.middleware;
     let mw_name = &mw.name;
@@ -887,13 +931,16 @@ async fn ensure_middleware(
     oidc_fields.insert(
         "Provider".to_owned(),
         serde_json::json!({
-            "Url": zitadel_url,
+            "Url": provider.url,
             "ClientId": client_id,
             "UsePkce": true,
             "ValidAudience": project_id,
         }),
     );
-    oidc_fields.insert("Scopes".to_owned(), serde_json::json!(&mw.scopes));
+    oidc_fields.insert(
+        "Scopes".to_owned(),
+        serde_json::json!(provider.scopes(&mw.scopes)),
+    );
     if mw.authorization_header {
         oidc_fields.insert(
             "AuthorizationHeader".to_owned(),
@@ -979,4 +1026,45 @@ fn fnv1a_128(data: &[u8]) -> u128 {
         h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013B);
     }
     h
+}
+
+#[cfg(test)]
+mod oidc_provider_tests {
+    use super::OidcProvider;
+
+    fn org(issuer: Option<&str>, id: Option<&str>) -> crate::Org {
+        let mut o = crate::Org::new("quota-fitness", "quota.fitness");
+        o.issuer = issuer.map(str::to_owned);
+        o.zitadel_org_id = id.map(str::to_owned);
+        o
+    }
+
+    #[test]
+    fn org_without_issuer_keeps_global_url_and_scopes() {
+        let p = OidcProvider::for_org(&org(None, Some("42")), "https://zitadel.example");
+        assert_eq!(p.url, "https://zitadel.example");
+        assert_eq!(p.org_scope, None);
+        let base = vec!["openid".to_owned(), "email".to_owned()];
+        assert_eq!(p.scopes(&base), base);
+    }
+
+    #[test]
+    fn org_issuer_sets_url_and_appends_org_scope_once() {
+        let p = OidcProvider::for_org(
+            &org(Some("https://sso.quota.fitness/"), Some("42")),
+            "https://zitadel.example",
+        );
+        assert_eq!(p.url, "https://sso.quota.fitness");
+        let scopes = p.scopes(&["openid".to_owned()]);
+        assert_eq!(scopes, ["openid", "urn:zitadel:iam:org:id:42"]);
+        // Already present: not duplicated.
+        assert_eq!(p.scopes(&scopes), scopes);
+    }
+
+    #[test]
+    fn org_issuer_without_known_org_id_adds_no_scope() {
+        let p = OidcProvider::for_org(&org(Some("https://sso.quota.fitness"), None), "https://z");
+        assert_eq!(p.url, "https://sso.quota.fitness");
+        assert_eq!(p.scopes(&["openid".to_owned()]), ["openid"]);
+    }
 }

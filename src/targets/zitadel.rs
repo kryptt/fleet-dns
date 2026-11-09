@@ -98,6 +98,12 @@ struct CreateOrgResponse {
     organization_id: String,
 }
 
+/// `POST /management/v1/projects` response.
+#[derive(Debug, Deserialize)]
+struct CreateProjectResponse {
+    id: String,
+}
+
 /// `POST /v2/organizations/{id}/metadata/search` response.
 #[derive(Debug, Deserialize)]
 struct OrgMetadataSearchResponse {
@@ -417,6 +423,23 @@ impl ZitadelClient {
         let projects = self.list_projects(org_id).await?;
         let found = projects.into_iter().find(|p| p.name == name).map(|p| p.id);
         Ok(found)
+    }
+
+    /// Create a project in an organization, returning its new ID.
+    ///
+    /// Requires `project.create` in that organization (IAM_ORG_MANAGER
+    /// carries it instance-wide).
+    pub async fn create_project(&self, name: &str, org_id: Option<&str>) -> Result<String, Error> {
+        let resp: CreateProjectResponse = self
+            .post_json(
+                "/management/v1/projects",
+                &serde_json::json!({ "name": name }),
+                "create_project",
+                org_id,
+            )
+            .await?;
+        info!(project_id = %resp.id, name, "created Zitadel project");
+        Ok(resp.id)
     }
 
     // -----------------------------------------------------------------------

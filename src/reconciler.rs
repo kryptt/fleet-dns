@@ -631,21 +631,32 @@ async fn reconcile_oidc(
         let org_id = org.zitadel_org_id.as_deref();
         let provider = OidcProvider::for_org(org, zitadel_url);
 
-        // Resolve project ID from name, within that organization.
+        // Resolve project ID from name, within that organization, creating
+        // the project when absent. A typo in `projectName` therefore makes a
+        // new project rather than failing, the same trade `Organization`'s
+        // `spec.create` makes.
         let project_id = match zitadel
             .find_project_by_name(&app.spec.project_name, org_id)
             .await?
         {
             Some(id) => id,
-            None => {
-                warn!(
+            None if dry_run => {
+                // No project ID to create an app under, so stop here.
+                info!(
                     crd = name,
                     project = app.spec.project_name,
                     org = %org.name,
-                    "Zitadel project not found, skipping OIDC app"
+                    "OIDC [dry-run] would create Zitadel project"
                 );
-                stats.skipped += 1;
+                stats.created += 1;
                 continue;
+            }
+            None => {
+                let id = zitadel
+                    .create_project(&app.spec.project_name, org_id)
+                    .await?;
+                stats.created += 1;
+                id
             }
         };
 

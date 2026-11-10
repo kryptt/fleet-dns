@@ -1,10 +1,11 @@
 use crate::crd_prelude::*;
 
 macro_rules! fleet_crd {
-    ($(#[doc = $doc:expr])* kind = $kind:literal, struct $name:ident { $($body:tt)* }) => {
+    ($(#[doc = $doc:expr])* kind = $kind:literal, $(#[$attr:meta])* struct $name:ident { $($body:tt)* }) => {
         $(#[doc = $doc])*
         #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
         #[kube(group = "fleet-dns.hr-home.xyz", version = "v1", kind = $kind, namespaced)]
+        $(#[$attr])*
         pub struct $name { $($body)* }
     };
 }
@@ -105,6 +106,10 @@ fleet_crd! {
     /// when an Organization resource declares it, never because one happens to
     /// exist in Zitadel.
     kind = "Organization",
+    // The CRD schema and every manifest spell these fields in camelCase
+    // (`manageDns`, `cloudflareZoneId`, ...). Without the rename serde looked
+    // for `manage_dns`, never found it, and defaulted it to false.
+    #[serde(rename_all = "camelCase")]
     struct OrganizationSpec {
     /// DNS zone this organization owns (e.g. "quota.fitness").
     pub zone: String,
@@ -372,5 +377,19 @@ mod tests {
             serde_json::from_value(dhcp_reservation_json("kitchen-sensor", None)).unwrap();
         assert_eq!(spec.hostname, "kitchen-sensor");
         assert!(spec.description.is_none());
+    }
+
+    #[test]
+    fn organization_spec_reads_camel_case_fields() {
+        let spec: OrganizationSpec = serde_json::from_value(serde_json::json!({
+            "zone": "quota.fitness",
+            "manageDns": true,
+            "cloudflareZoneId": "z1",
+            "unboundAnchor": "ha.quota.fitness",
+        }))
+        .unwrap();
+        assert!(spec.manage_dns);
+        assert_eq!(spec.cloudflare_zone_id.as_deref(), Some("z1"));
+        assert_eq!(spec.unbound_anchor.as_deref(), Some("ha.quota.fitness"));
     }
 }

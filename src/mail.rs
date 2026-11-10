@@ -322,7 +322,10 @@ impl MailReconciler {
             clauses.push(format!("(mail={})", ldap_escape(a)));
             clauses.push(format!("(mailAlias={})", ldap_escape(a)));
         }
-        let filter = format!("(|{})", clauses.concat());
+        // Only inetOrgPerson entries can become Stalwart principals (its login
+        // and recipient filters require it), so posix-only identities such as
+        // uid=<agent>,ou=services don't block a mailbox of the same name.
+        let filter = format!("(&(objectClass=inetOrgPerson)(|{}))", clauses.concat());
         let (rs, _) = ldap
             .search(&self.cfg.base_dn, Scope::Subtree, &filter, vec!["1.1"])
             .await?

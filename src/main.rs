@@ -144,6 +144,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // 8c. Optionally build the MailAccount reconciler.
+    let mail = match fleet_dns::mail::MailConfig::from_env()? {
+        Some(mail_config) => {
+            info!(domains = ?mail_config.domains, "mail account management enabled");
+            let (store, handle) = discovery::start_watcher::<fleet_dns::crd::MailAccount>(
+                kube_client.clone(),
+                "mailaccount",
+            );
+            spawn_critical("mailaccount", handle);
+            Some(fleet_dns::mail::MailReconciler::new(
+                mail_config,
+                store,
+                kube_client.clone(),
+                dry_run,
+            ))
+        }
+        None => {
+            info!("mail account management disabled (MAIL_DOMAINS not configured)");
+            None
+        }
+    };
+
     // 9. Build reconciler.
 
     let reconciler = Arc::new(Reconciler::new(
@@ -204,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tokio::select! {
-        _ = run_reconcile_loop(reconciler, notify) => {}
+        _ = run_reconcile_loop(reconciler, mail, notify) => {}
         _ = shutdown => {
             info!("shutting down");
         }
@@ -218,12 +240,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// At most one reconciliation is in flight at a time -- if a notification
 /// arrives while a pass is running, it is coalesced into the next pass.
-async fn run_reconcile_loop(reconciler: Arc<Reconciler>, notify: Arc<Notify>) {
+async fn run_reconcile_loop(
+    reconciler: Arc<Reconciler>,
+    mail: Option<fleet_dns::mail::MailReconciler>,
+    notify: Arc<Notify>,
+) {
     loop {
         notify.notified().await;
 
         if let Err(e) = reconciler.run_once().await {
             error!(error = %e, "reconciliation pass failed");
+        }
+        // Independent of DNS: a DNS failure must not block mail, nor vice versa.
+        if let Some(mail) = &mail
+            && let Err(e) = mail.run_once().await
+        {
+            error!(error = %e, "mail account reconciliation failed");
         }
     }
 }

@@ -242,6 +242,60 @@ pub struct OidcMiddlewareSpec {
     pub authorization_header: bool,
 }
 
+/// Spec for a MailAccount custom resource.
+///
+/// Declares a mailbox `<localPart>@<domain>`. The domain is NOT part of the
+/// spec: fleet-dns takes it from its own `MAIL_DOMAINS` namespace map, so a
+/// namespace can only ever mint addresses in the domain the cluster operator
+/// assigned to it. fleet-dns writes the account as an LDAP entry under the
+/// bots OU (Stalwart reads mail accounts from LDAP) and puts its generated
+/// password in the Secret `mail-<name>` next to this resource. Delete that
+/// Secret to rotate the password.
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "fleet-dns.hr-home.xyz",
+    version = "v1",
+    kind = "MailAccount",
+    namespaced,
+    status = "MailAccountStatus"
+)]
+#[serde(rename_all = "camelCase")]
+pub struct MailAccountSpec {
+    /// Mailbox local part, e.g. `dave` for `dave@<domain>`. Lowercase
+    /// letters, digits, `.`, `_` and `-`.
+    pub local_part: String,
+
+    /// Human-readable name. Defaults to the local part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
+    /// Extra local parts in the same domain that deliver to, and may be sent
+    /// as from, this mailbox.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// Status of a MailAccount, written by fleet-dns.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MailAccountStatus {
+    /// Full primary address, once accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+
+    /// True when the LDAP entry and the password Secret are in place.
+    #[serde(default)]
+    pub ready: bool,
+
+    /// Why the account is not ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+
+    /// Secret holding `address` and `password`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+}
+
 pub(crate) fn default_true() -> bool {
     true
 }
@@ -377,6 +431,18 @@ mod tests {
             serde_json::from_value(dhcp_reservation_json("kitchen-sensor", None)).unwrap();
         assert_eq!(spec.hostname, "kitchen-sensor");
         assert!(spec.description.is_none());
+    }
+
+    #[test]
+    fn mail_account_spec_reads_camel_case_fields() {
+        let spec: MailAccountSpec = serde_json::from_value(serde_json::json!({
+            "localPart": "dave",
+            "displayName": "Dave",
+        }))
+        .unwrap();
+        assert_eq!(spec.local_part, "dave");
+        assert_eq!(spec.display_name.as_deref(), Some("Dave"));
+        assert!(spec.aliases.is_empty());
     }
 
     #[test]

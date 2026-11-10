@@ -358,7 +358,7 @@ fn require_env(name: &str) -> Result<String, Error> {
 
 /// Read a secret value, trying `{name}_FILE` first (reading and trimming the
 /// file contents), then falling back to the direct `{name}` env var.
-fn read_secret(name: &str) -> Result<String, Error> {
+pub(crate) fn read_secret(name: &str) -> Result<String, Error> {
     let file_var = format!("{name}_FILE");
 
     if let Ok(path) = std::env::var(&file_var) {

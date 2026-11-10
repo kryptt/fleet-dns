@@ -5,6 +5,7 @@ pub mod crd;
 pub mod crd_prelude;
 pub mod discovery;
 pub mod error;
+pub mod mail;
 pub mod metrics;
 pub mod oidc_state;
 pub mod reconciler;

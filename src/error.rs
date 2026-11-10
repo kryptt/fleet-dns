@@ -20,6 +20,9 @@ pub enum Error {
 
     #[error("zitadel error: {0}")]
     Zitadel(String),
+
+    #[error("mail error: {0}")]
+    Mail(String),
 }
 
 impl Error {
@@ -34,6 +37,7 @@ impl Error {
             Error::OpnSense(_) => "opnsense",
             Error::Cloudflare(_) => "cloudflare",
             Error::Zitadel(_) => "zitadel",
+            Error::Mail(_) => "mail",
         }
     }
 }
@@ -53,5 +57,11 @@ impl From<reqwest::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::SerdeJson(e)
+    }
+}
+
+impl From<ldap3::LdapError> for Error {
+    fn from(e: ldap3::LdapError) -> Self {
+        Error::Mail(e.to_string())
     }
 }

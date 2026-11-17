@@ -249,7 +249,18 @@ pub fn build_desired_state(
     orgs: &Orgs,
 ) -> DnsState {
     // Collect all (hostname, source_key, IngressRoute) tuples, then deduplicate.
+    // A route carrying `hr-home.xyz/dns: "true"` beats an unlabelled one for the
+    // same host (path-split routes rarely repeat the labels); otherwise the
+    // lower source wins, so the choice is stable.
     let mut candidates: HashMap<String, (String, &IngressRoute, &Org)> = HashMap::new();
+    let rank = |ir: &IngressRoute, source: &str| {
+        let managed = ir
+            .metadata
+            .labels
+            .as_ref()
+            .is_some_and(|l| get_label(l, "dns") == Some("true"));
+        (!managed, source.to_owned())
+    };
 
     for ir in ingress_store {
         let source = source_key(&ir.metadata);
@@ -263,12 +274,14 @@ pub fn build_desired_state(
                 };
 
                 match candidates.get(&hostname) {
-                    Some((existing_source, _, _)) if existing_source <= &source => {
+                    Some((existing_source, existing_ir, _))
+                        if rank(existing_ir, existing_source) <= rank(ir, &source) =>
+                    {
                         warn!(
                             hostname,
                             existing = %existing_source,
                             duplicate = %source,
-                            "duplicate hostname across IngressRoutes, keeping lower source"
+                            "duplicate hostname across IngressRoutes, keeping existing"
                         );
                     }
                     Some((existing_source, _, _)) => {
@@ -276,7 +289,7 @@ pub fn build_desired_state(
                             hostname,
                             existing = %existing_source,
                             duplicate = %source,
-                            "duplicate hostname across IngressRoutes, replacing with lower source"
+                            "duplicate hostname across IngressRoutes, replacing existing"
                         );
                         candidates.insert(hostname, (source.clone(), ir.as_ref(), org));
                     }
@@ -1216,6 +1229,32 @@ mod tests {
         // "home/hass" < "ingress/hass-redirect" lexicographically
         assert_eq!(entry.source, "home/hass");
         assert!(entry.managed);
+    }
+
+    #[test]
+    fn duplicate_hostname_labelled_route_wins() {
+        // quota/api (path route, no labels) sorts before quota/web (labelled).
+        let api = make_ingress_route(
+            "quota",
+            "api",
+            "Host(`staging.hr-home.xyz`) && PathPrefix(`/api`)",
+            "api-svc",
+            BTreeMap::new(),
+        );
+        let web = make_ingress_route(
+            "quota",
+            "web",
+            "Host(`staging.hr-home.xyz`)",
+            "web-svc",
+            labels(&[("hr-home.xyz/dns", "true")]),
+        );
+
+        for order in [[api.clone(), web.clone()], [web.clone(), api.clone()]] {
+            let state = build_desired_state(&order, &[], &[], traefik_ip(), &orgs());
+            let entry = state.get("staging.hr-home.xyz").unwrap();
+            assert_eq!(entry.source, "quota/web");
+            assert!(entry.managed);
+        }
     }
 
     #[test]

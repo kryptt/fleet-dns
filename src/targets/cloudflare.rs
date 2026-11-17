@@ -3,7 +3,7 @@ use std::{net::IpAddr, time::Duration};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::Error;
 use crate::state::{CloudflareMode, DnsEntry};
@@ -103,6 +103,12 @@ fn format_errors(errors: &[CloudflareError]) -> String {
         .map(|e| format!("[{}] {}", e.code, e.message))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Cloudflare 81062: the host already belongs to a Workers custom domain.
+/// That record is Cloudflare's, not ours, so it cannot be written.
+fn is_workers_managed(err: &Error) -> bool {
+    matches!(err, Error::Cloudflare(msg) if msg.contains("[81062]"))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,8 +436,24 @@ impl CloudflareClient {
             } else {
                 "CNAME record"
             };
-            self.ensure_record(zone_id, existing, &body, dry_run, label, &mut stats)
-                .await?;
+            match self
+                .ensure_record(zone_id, existing, &body, dry_run, label, &mut stats)
+                .await
+            {
+                // A labelled route on a Worker-owned host must not abort the
+                // whole zone pass: skip that one host and carry on.
+                Err(e) if is_workers_managed(&e) => {
+                    warn!(
+                        hostname = %entry.hostname,
+                        error = %e,
+                        "host is a Cloudflare Workers custom domain; skipping. Drop the \
+                         hr-home.xyz/dns label from its IngressRoute, or remove the \
+                         Worker's custom domain"
+                    );
+                    stats.skipped += 1;
+                }
+                other => other?,
+            }
         }
 
         // --- Step 3: Delete orphaned records ---
@@ -493,6 +515,18 @@ fn test_entry(hostname: &str, managed: bool, mode: CloudflareMode) -> DnsEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_managed_error_is_recognised() {
+        let workers = Error::Cloudflare(
+            "create_record(quota.fitness) failed: [81062] A DNS record managed by Workers \
+             already exists on that host."
+                .to_owned(),
+        );
+        assert!(is_workers_managed(&workers));
+        let other = Error::Cloudflare("create_record(x) failed: [81054] conflict".to_owned());
+        assert!(!is_workers_managed(&other));
+    }
 
     #[test]
     fn reconcile_stats_default_is_all_zeros() {

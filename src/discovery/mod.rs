@@ -28,11 +28,27 @@ where
 {
     let api: Api<T> = Api::all(client);
     let (reader, writer) = reflector::store();
-    let config = watcher::Config::default();
-    let stream = watcher(api, config).default_backoff().reflect(writer);
+    let config = if T::kind(&()) == "Pod" {
+        watcher::Config::default().fields(LIVE_POD_SELECTOR)
+    } else {
+        watcher::Config::default()
+    };
+    // managedFields is never read and is often the largest part of an object.
+    let stream = watcher(api, config)
+        .default_backoff()
+        .modify(|obj| obj.meta_mut().managed_fields = None)
+        .reflect(writer);
     let handle = drive_watch(resource_name, stream);
     (reader, handle)
 }
+
+/// Field selector [`start_watcher`] applies to Pods: only pods that can still back a route.
+///
+/// Terminated pods (Failed: evicted, OOMKilled-and-replaced; Succeeded: Job
+/// pods) never serve traffic, and the API keeps them until GC. On 2026-11-20 a
+/// node under DiskPressure produced 12k evicted pods; caching them all
+/// OOMKilled fleet-dns at its 128Mi limit within a second of startup.
+pub const LIVE_POD_SELECTOR: &str = "status.phase!=Failed,status.phase!=Succeeded";
 
 /// A single entry from the Multus `k8s.v1.cni.cncf.io/network-status` JSON annotation.
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +128,13 @@ where
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// start_watcher keys the live-pod field selector on this exact kind string.
+    #[test]
+    fn pod_kind_matches_selector_switch() {
+        use k8s_openapi::api::core::v1::Pod;
+        assert_eq!(<Pod as kube::Resource>::kind(&()), "Pod");
+    }
 
     /// Parse a Multus annotation for the default "lan-macvlan" network.
     fn multus_lan(annotation: &str) -> Option<IpAddr> {
